@@ -60,8 +60,14 @@ if (-not $cmake) { $cmake = Find-Tool 'cmake.exe' }
 $ninja = Get-CachedTool 'CMAKE_MAKE_PROGRAM'
 if (-not $ninja) { $ninja = Find-Tool 'ninja.exe' }
 
+# The toolchain file expects arm-none-eabi-gcc on PATH. Without this, a build
+# dir that has just been wiped (-Clean, or a moved/renamed workspace) cannot
+# even configure, because the cached absolute compiler path is gone.
+$gcc = Get-CachedTool 'CMAKE_C_COMPILER'
+if (-not $gcc) { $gcc = Find-Tool 'arm-none-eabi-gcc.exe' }
+
 # The Ninja generator needs ninja.exe on PATH.
-$env:PATH = (Split-Path $ninja -Parent) + ';' + (Split-Path $cmake -Parent) + ';' + $env:PATH
+$env:PATH = (Split-Path $gcc -Parent) + ';' + (Split-Path $ninja -Parent) + ';' + (Split-Path $cmake -Parent) + ';' + $env:PATH
 
 Push-Location $Root
 try {
