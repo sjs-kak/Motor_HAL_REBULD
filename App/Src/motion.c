@@ -226,14 +226,26 @@ u8 Motion_IsMoving(void)
  * ------------------------------------------------------------------------ */
 void Motion_Tick(void)
 {
+    /* ① 安全网优先于一切：两侧速度都是 0 就绝不该有脉冲。
+     *
+     *    ⚠️ 这一条**必须**放在 s_alive_ms 判断之前。曾经的顺序是先
+     *    `if (s_alive_ms == 0) return;` —— 而看门狗停车时恰好会把 s_alive_ms
+     *    清零，于是之后每圈都在第一行返回，安全网永远执行不到
+     *    （实测 s_forced_cnt 恒为 0 正是这个原因）。
+     *
+     *    CEN 已经是 0 时这里只有两次寄存器读，零开销。 */
+    if ((s_speed_left == 0) && (s_speed_right == 0))
+    {
+        Bsp_MotorPulse_EnsureStopped();
+        s_alive_ms = 0;                    /* 已停稳，看门狗一并复位 */
+        return;
+    }
+
     if (s_alive_ms == 0)
     {
         return;                            /* 还没收到过任何运动命令 */
     }
-    if ((s_speed_left == 0) && (s_speed_right == 0))
-    {
-        return;                            /* 已经停着，不用管 */
-    }
+
     if ((Osal_GetTickMs() - s_alive_ms) > CFG_CMD_TIMEOUT_MS)
     {
         Motion_Stop();
