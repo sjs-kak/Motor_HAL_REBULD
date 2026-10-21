@@ -194,10 +194,12 @@ static void App_ExecCmd(const char *cmd)
         /* ---- 状态 / 帮助 ---- */
         case '?':
             Motion_GetSpeed(&a, &b);
-            LOG("SPD L=%d R=%d ACC=%d%s TXDROP=%u\r\n",
+            LOG("SPD L=%d R=%d ACC=%d%s TXDROP=%u RXTOT=%u RXERR=%u\r\n",
                 (int)a, (int)b, (int)Motion_GetAccel(),
                 (Motion_Aborted() != 0) ? " ABORT" : "",
-                (unsigned int)Bsp_Uart_GetTxDropCount());
+                (unsigned int)Bsp_Uart_GetTxDropCount(),
+                (unsigned int)Bsp_Uart_GetRxTotal(),
+                (unsigned int)Bsp_Uart_GetRxErrorCount());
             break;
 
         case 'H':

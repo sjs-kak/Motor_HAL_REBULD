@@ -196,17 +196,24 @@ void Bsp_Uart_SendBuf(const u8 *buf, u16 len)
     }
 }
 
-u32 Bsp_Uart_GetTxDropCount(void)
+/* 诊断计数读取接口：调试器里用 `print Bsp_Uart_GetRxTotal()` 调用。
+ *
+ * 为什么必须加 __attribute__((used))：链接参数带 -Wl,--gc-sections
+ * （cmake/gcc-arm-none-eabi.cmake:45），固件里没有任何代码引用这三个
+ * 函数时，它们会在链接期被整段回收，调试器就报
+ *   No symbol "Bsp_Uart_GetRxTotal" in current context.
+ * 标 used 只是不让 GC 删掉，不增加任何运行开销。 */
+__attribute__((used)) u32 Bsp_Uart_GetTxDropCount(void)
 {
     return s_tx_drop;
 }
 
-u32 Bsp_Uart_GetRxTotal(void)
+__attribute__((used)) u32 Bsp_Uart_GetRxTotal(void)
 {
     return s_rx_total;
 }
 
-u32 Bsp_Uart_GetRxErrorCount(void)
+__attribute__((used)) u32 Bsp_Uart_GetRxErrorCount(void)
 {
     return s_rx_err;
 }
