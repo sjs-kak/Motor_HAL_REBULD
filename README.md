@@ -125,6 +125,14 @@ Debug 构建：`-O0 -g3`，同时生成 `.map` 和每个文件的 `.su`（栈用
 | `Motion_GetSpeed(s32 *l, s32 *r)` | 底层：读回当前已下达的速度 |
 | `Motion_SetAccel(u32 hzPerSec)` | 改加速度，对后续变速立即生效；传 0 被忽略 |
 | `Motion_GetAccel()` | 读回当前加速度 |
+| `Motion_Stop()` | 🆕 **立即停脉冲**（不等 S 曲线），急停用 |
+| `Motion_RequestAbort()` | 🆕 **请求中止当前阻塞动作**；可在中断里调，最迟 8 ms 生效 |
+| `Motion_ClearAbort()` | 🆕 清中止标志；每接受一条新命令时调一次 |
+| `Motion_Aborted()` | 🆕 查询是否处于已中止状态 |
+| `Motion_NotifyAlive()` | 🆕 上位机心跳，喂通信看门狗 |
+| `Motion_Tick()` | 🆕 主循环每圈调一次；掉线超时自动停车 |
+| `Motion_IsMoving()` | 🆕 当前是否有速度 |
+| `Motion_Demo()` | 🆕 原来的六段演示，改成串口命令 `D` 触发 |
 
 `Motion_Drive / Steer / Brake` 都是**阻塞**动作，语义固定为：
 
@@ -133,6 +141,11 @@ S 曲线变速（时长由加速度决定）→ 到达目标速度 → 保持 ho
 ```
 
 **变速耗时不计入 `holdMs`**。起始速度不用传，本层内部记住“当前已下达速度”，自动从那里开始过渡。
+
+🆕 **换向必须先停**：任一侧速度符号翻转时，本层自动插入
+「平滑降到 0 → 停脉冲 → 等 `CFG_MOTION_DIR_SETTLE_MS`（300 ms）→ 再朝新方向加速」，
+让 DIR 只在**没有脉冲边沿**时切换（M860D 要求 DIR 至少提前 PUL 下降沿 5 µs）。
+拒绝这条路径，驱动器就会在转子还在正转时收到反相脉冲 → 丢步、抖动、电流上升。
 
 ```c
 #include "motion.h"
@@ -147,7 +160,7 @@ Motion_Brake();                  /* S 曲线降到 0 */
 ### 3.2 S 曲线变速
 
 - 曲线表：`App/Src/motion.c` 里 101 点余弦 S 曲线（0～1000 的千分比），两端斜率为 0。
-- 加速度：`Config/Inc/cfg_motion.h` 的 `CFG_SCURVE_ACCEL_HZ_PER_S`（默认 **2000 Hz/s**，即“1000 Hz 用 500 ms”）。
+- 加速度：`Config/Inc/cfg_motion.h` 的 `CFG_SCURVE_ACCEL_HZ_PER_S`（默认 **1000 Hz/s**，即“1200 Hz 用 1200 ms”；2026-10-21 调试期从 2000 调保守）。
 - 变速时长 = `两侧速度差中较大者 × 1000 / 加速度`，下限 `CFG_SCURVE_MIN_MS`（20 ms）。
 - 按真实经过时间推进（`Osal_GetTickMs`），不靠数循环次数，`DelayMs` 抖动不会累积。
 - 左右共用同一条进度曲线 → 差速转向时两轮同时到位，轨迹不歪。
@@ -157,29 +170,55 @@ Motion_Brake();                  /* S 曲线降到 0 */
 Motion_SetAccel(4000);   /* 变速快一倍：0 → 2500Hz 用 625ms */
 ```
 
-### 3.3 上电演示（`Core/Src/main.c` USER CODE 2 段）
+### 3.3 六段演示（现在是命令 `D`，不再上电自动跑）
 
-`App_Init()` 之后直接调用六段动作，总时长约 **13.25 秒**，跑完进主循环，不会自己重跑（要重跑按复位）：
+> ⚠️ **2026-10-21 改动**：这六段以前无条件写在 `Core/Src/main.c` 的 USER CODE 2 段里，上电即跑。
+> 现在已从 `main()` 删除，搬到 `App/Src/motion.c` 的 `Motion_Demo()`，**由串口命令 `D` 触发**。
+> 原因见 §10.1。
+
+内容一字未改，总时长约 **13.25 秒**，中途发 `E` 可随时打断：
 
 | 段 | 调用 | 斜坡 | 保持 | 累计 |
 |---|---|---|---|---|
 | 1 | `Motion_Drive(2500, 1000)` | 1250 ms | 1000 ms | 2.25 s |
-| 2 | `Motion_Steer(1000, 2500, 1000)` 左转 | 750 ms | 1000 ms | 4.00 s |
-| 3 | `Motion_Steer(2500, 1000, 1000)` 回正 | 750 ms | 1000 ms | 5.75 s |
+| 2 | `Motion_Steer(2500, 1000, 1000)` **右转** | 750 ms | 1000 ms | 4.00 s |
+| 3 | `Motion_Steer(1000, 2500, 1000)` 回正（反向等量） | 750 ms | 1000 ms | 5.75 s |
 | 4 | `Motion_Drive(2500, 1000)` 前进 | 750 ms | 1000 ms | 7.50 s |
 | 5 | `Motion_Drive(-2500, 2000)` 倒车 | 2500 ms | 2000 ms | 12.00 s |
 | 6 | `Motion_Brake()` 停车 | 1250 ms | — | 13.25 s |
 
-> ⚠️ 这六行写在 `main()` 里、`App_Loop()` 之前，因此**在 `osKernelStart()` 之前**。裸机成立；
-> 一旦接入 RTOS，这段必须搬进任务里（见 §9.7 的 R4）。
+> 第 5 段的 2500 ms 里，前 1250 ms 是降到 0，然后停 300 ms 等 DIR 建立，再 1250 ms 反向加速。
+>
+> 📌 **2026-10-21 晚：第 2、3 段对调** —— 原来先左转再回正，现在改成**先右转再反向等量回正**（`Motion_Demo()` 里两行互换，头文件与 `D` 命令不变）。
+>
+> ⚠️ **上表的数字是“不夹紧”时的理论值**。调试保守档下 `CFG_MOTION_MAX_SPEED_HZ = 1200`、
+> 加速度 1000 Hz/s，实际每段按 1200 Hz 跑：斜坡更长（0→1200 需 1200 ms），第 5 段换向约 2.7 s，
+> 演示总时长约 12 秒。逻辑与段序完全不变，只是慢一些、电流小一些。
 
-### 3.4 串口
+### 3.4 串口命令（`App/Src/app_init.c`）
 
-- **接收**：USART1 中断逐字节收，`HAL_UART_RxCpltCallback` → `Protocol_FeedByte()` 组帧。
-  帧规则：**以 `0x0D 0x0A`（回车 + 换行）结尾**，最长 `PROTOCOL_FRAME_MAX`（200）字节。
-- **回显**：`App_Loop()` 取到完整帧后打印 `RX: <内容>`。目前**没有命令解析**（`app_init.c` 里是 TODO），收到什么只回显什么。
+115200 8N1。**帧必须以 `0x0D 0x0A`（回车+换行）结尾**，最长 `PROTOCOL_FRAME_MAX`（200）字节。
+唯一例外是急停：`E` / `e` / `ESC` **单字节**立即生效。
+
+| 命令 | 作用 | 例 |
+|---|---|---|
+| `E` `e` `ESC` | **急停**：立刻停脉冲，不等 S 曲线（最迟 8 ms） | `E`（不用回车） |
+| `S` | 平滑停：走 S 曲线降到 0 | `S` |
+| `?` | 打印当前左右速度、加速度、是否处于中止态 | `?` |
+| `H` / `h` | 帮助 | `H` |
+| `F<n>` | 直行：两侧 `<n>` Hz，正=前进、负=后退、0=停 | `F2500` / `F-1200` |
+| `L<a>,<b>` | 差速：左 `<a>` Hz、右 `<b>` Hz | `L1000,2500` |
+| `A<n>` | 改加速度 `<n>` Hz/s | `A1000` |
+| `D` | 跑六段演示（13 秒，可按 `E` 打断） | `D` |
+
+🆕 **掉线保护**：收到 `F` / `L` 之后，如果 `CFG_CMD_TIMEOUT_MS`（默认 **3 秒**）内没有新的运动命令，
+`Motion_Tick()` 会自动停车。也就是说**想持续走就得持续发命令**——这正好保证“拔了串口线车不会一直跑”。
+（上位机按 1 Hz 重发当前速度即可。）
+
+- **接收**：USART1 中断逐字节收 → `App_RxByte()`（先抓急停，再转给 `Protocol_FeedByte()` 组帧）。
+- **错误恢复**：`HAL_UART_ErrorCallback()` 清 ORE/FE/NE 并重新武装接收。没有它，一次溢出就永久失聪到复位。
 - **发送**：`LOG("...")` → `printf` → `__io_putchar()` → `Bsp_Uart_SendByte()`（阻塞发送，不占中断）。
-- 主循环里上一帧没被取走时，新来的字节会被丢弃（不排队）。
+- 主循环没来得及取帧时，**新帧覆盖旧帧**（不再丢新字节）。
 
 ```c
 LOG("boot ok, clk=%lu\r\n", (unsigned long)SystemCoreClock);   /* 任意位置都能用 */
@@ -189,14 +228,14 @@ LOG("boot ok, clk=%lu\r\n", (unsigned long)SystemCoreClock);   /* 任意位置�
 
 | 项 | 现状 |
 |---|---|
-| 串口命令解析 | `App/Src/app_init.c` 里是 TODO，收帧只回显 |
 | 闭环/编码器 | 无，纯开环脉冲输出 |
-| 驱动器使能引脚 | 无，需硬件接死 |
-| 串口错误恢复 | 没有 `HAL_UART_ErrorCallback`。发生 ORE/FE 溢出后 HAL 不再重新武装接收，**串口会静默失聪直到复位** |
+| 驱动器使能引脚 | 无；M860D 的 ENA 默认悬空不接（要用需比 DIR 提前 300 ms） |
+| 驱动器 ALM 回读 | 无。M860D 的红灯闪 1 次=过流、闪 2 次=过压，固件看不到 |
+| 电流/电压采样 | 无。过载只能靠上位机/人看驱动器灯 |
 | 故障现场 | `Error_Handler()`（`main.c`）和 `HardFault_Handler()`（`stm32f4xx_it.c`）都是 `while(1)`，无输出 |
-| 栈余量 | 链接脚本 `_Min_Stack_Size` 只有 0x400（1 KB），`printf` 用 `nano.specs` 格式化浮点时注意 |
+| 栈余量 | 链接脚本 `_Min_Stack_Size` 只有 0x400（1 KB）。当前最深调用链 ≈ 520 B，余量约一半；再加局部大数组前先看 `.su` |
 | 多路串口 | `HAL_UART_RxCpltCallback` 是全工程唯一强定义，且**硬编码只认 USART1**；加第二路串口必须先改这里 |
-| `Protocol_TakeFrame` 返回类型 | 声明为 `u16`，但语义只有 1/0，应为 `u8` |
+| 停车≠断电 | `Motion_Stop()` 只停脉冲，驱动器仍锁轴（静态电流约峰值 50%）。真正断电只能断 ENA 或主电 |
 
 ---
 
@@ -246,15 +285,15 @@ F5 选 **“无线调试器：下载并调试（OpenOCD + CMSIS-DAP）”**：�
 
 ### 4.4 跑起来看什么
 
-1. 上电 13.25 秒内电机依次执行：前进 → 左转 → 回正 → 前进 → 倒车 → 停车。
-2. 串口每隔一段收到 `RX: ...`（你发什么它就回什么）。
-3. 用示波器/逻辑分析仪夹 PE9，段 1 的保持期应看到 **2500 Hz 方波，周期 400 µs、高电平 200 µs**。
+1. **上电不会再自动跑演示**（§10）。发 `D` 后依次执行：前进 → **右转** → 回正 → 前进 → 倒车 → 停车。
+2. 串口收到 `DEMO start (send E to abort)`，结束后收到 `DEMO done`。
+3. 用示波器/逻辑分析仪夹 **PE9**，段 1 的保持期应看到 **1200 Hz 方波，周期 833 µs、高电平 417 µs**（保守调试档；提档后按下表换算）。
 
 ### 4.5 改一版自己试
 
 | 想改什么 | 改哪里 |
 |---|---|
-| 某一段的速度/时长 | `Core/Src/main.c` USER CODE 2 段的六行调用 |
+| 某一段的速度/时长 | `App/Src/motion.c` 的 `Motion_Demo()` 六行调用 |
 | 加速度（调速快慢） | `Config/Inc/cfg_motion.h` 的 `CFG_SCURVE_ACCEL_HZ_PER_S`，或运行期 `Motion_SetAccel()` |
 | 最大/最小脉冲频率 | `Config/Inc/cfg_motor.h` 的 `CFG_PUL_MAX_HZ` / `CFG_PUL_MIN_HZ` |
 | 串口波特率 | `Core/Src/usart.c`（CubeMX 生成，改 `.ioc` 更保险） |
@@ -575,14 +614,17 @@ u32  Osal_GetTickMs(void);
 
 这六条不依赖任何新功能，纯属修漏，建议作为第一阶段。
 
+> ✅ **2026-10-21 进展：X1、X4 见 §10；X2、X3、X5、X6 见 §11.5 —— 六条已全部完成。**
+> 下面表格保留原始描述（含当时的验收口径），便于对照当时的设计意图。
+
 | 编号 | 项 | 落点 | 动作 | 风险 | 验收 |
 |---|---|---|---|---|---|
-| X1 | **补 `HAL_UART_ErrorCallback`** | `Bsp/Src/bsp_uart.c` | 清 ORE/FE/NE/PE 标志，并重新武装 `HAL_UART_Receive_IT()` | 低 | 串口压测 10 万帧后仍不失聪（当前 ORE 后会静默失聪到复位） |
-| X2 | **串口回调按 `Instance` 分发** | `Bsp/Src/bsp_uart.c` 回调处 | 改为注册表：`Bsp_Uart_RegisterRxHandler(instance, handler)`，或在回调里 if/else 分发 | 低 | 两路串口各自收自己的字节，互不抢占 |
-| X3 | **NVIC 分组改 GROUP_4** | `.ioc` 的 NVIC 分组设置，或 `Core/Src/stm32f4xx_hal_msp.c` | 4 位全部用作抢占优先级 | **中**（现有 USART1 是 3/3，改完要重算） | 中断仍正常；上 RTOS 后 `configASSERT` 不触发 |
-| X4 | `Protocol_TakeFrame()` 返回类型 | `Service/Inc/protocol.h` + `protocol.c` | `u16` → `u8`（语义本来就是 1/0） | 低 | 编译通过，调用点无告警 |
-| X5 | 新增配置头 | 新增 `Config/Inc/cfg_rtos.h`、`Config/Inc/cfg_cam.h` | 任务栈/优先级/队列长度；相机波特率、帧长上限、超时、坐标量纲 | 低 | 常量集中，不再散落魔数 |
-| X6 | 补故障现场输出 | `Core/Src/main.c` 的 `Error_Handler()`、`Core/Src/stm32f4xx_it.c` 的 `HardFault_Handler()` | 至少把出错位置打印出来（串口）再 `while(1)` | 低 | 故意制造一次错误，能看到输出 |
+| X1 ✅ | **补 `HAL_UART_ErrorCallback`** | `Bsp/Src/bsp_uart.c` | 清 ORE/FE/NE 标志 + 清 `ErrorCode` + 重新武装 `HAL_UART_Receive_IT()` | 低 | 串口压测 10 万帧后仍不失聪 |
+| X2 ✅ | **串口回调按 `Instance` 分发** | `Bsp/Src/bsp_uart.c` 回调处 | 改为注册表：`Bsp_Uart_OpenChannel(huart, handler)`，回调里按 `Instance` 查表 | 低 | 两路串口各自收自己的字节，互不抢占 |
+| X3 ✅ | **NVIC 分组改 GROUP_4** | `Core/Src/stm32f4xx_hal_msp.c` + `Core/Src/usart.c` | 4 位全部用作抢占优先级；USART1 由 `3,3` 改为 `3,0` | **中**（已重算：只剩 USART1 一处子优先级） | 中断仍正常；上 RTOS 后 `configASSERT` 不触发 |
+| X4 ✅ | `Protocol_TakeFrame()` 返回类型 | `Service/Inc/protocol.h` + `protocol.c` | `u16` → `u8`（语义本来就是 1/0） | 低 | 编译通过，调用点无告警 |
+| X5 ✅ | 新增配置头 | 新增 `Config/Inc/cfg_rtos.h`、`Config/Inc/cfg_cam.h` | 任务栈/优先级/队列长度；相机波特率、帧长上限、超时、坐标量纲 | 低 | 常量集中，不再散落魔数 |
+| X6 ✅ | 补故障现场输出 | `Core/Src/main.c` 的 `Error_Handler()`、`Core/Src/stm32f4xx_it.c` 的 `HardFault_Handler()` | 新增 `Bsp/Src/bsp_fault.c`：寄存器级轮询发送，把 PC/LR/CFSR/HFSR 打出来再停机 | 低 | 故意制造一次错误，能看到输出 |
 
 > X3 值得单独强调：这条不改，将来上 FreeRTOS 时 `vPortValidateInterruptPriority()` 会直接断言，
 > 而且报错信息不直观，很容易在 RTOS 阶段浪费一天。
@@ -750,7 +792,7 @@ void Service_DepthCam_TakeResult(DepthCam_Result *out);    /* App 轮询 */
 | RK5 | FreeRTOS heap 与 128 KB 主 RAM 冲突 | R6 | 用 `.map` 与各函数 `.su` 报告核定；目标 RAM 占用 < 90% |
 | RK6 | 相机整帧缓冲挤占 RAM | C2 / C5 | 只传结果不上图；DCMI 分支用行缓冲 + DMA，且禁止放 CCM |
 | RK7 | CubeMX 重新生成覆盖手写代码 | 任何阶段 | 严守 P1/P2；只写 `USER CODE` 段 |
-| RK8 | 中文路径导致命令行构建卡死 | 任何阶段 | 只用 IDE 的 Build / F5，不用命令行 `ninja` |
+| RK8 | 中文路径导致命令行构建卡死 | 任何阶段 | **已实测不成立**：`tools\build.ps1`（`cmake --build --preset`）可以直接在命令行编译，见 §10.3。IDE 的 Build/F5 依旧可用 |
 | RK9 | 改时钟树忘记同步常量 → 转速静默出错 | R1（或任何改 `.ioc` 的操作） | 每次动 `.ioc` 后核对 `cfg_motor.h` 的 `CFG_TIM1_CLK_HZ` / `CFG_TIM2_CLK_HZ` |
 | RK10 | 新增 `.c` 忘记注册进 CMake，功能静默失效 | 任何阶段 | 遵守 P4；改完在 `.map` 里搜一下新符号 |
 
@@ -759,3 +801,375 @@ void Service_DepthCam_TakeResult(DepthCam_Result *out);    /* App 轮询 */
 **现有工程是一个分层干净、CubeMX 隔离良好的裸机四轮驱动底座**：硬件知识全在 `Bsp`，OS 切换点全在 `Osal`，业务唯一入口是 `App_Init/App_Loop`。
 **下一步不是重写，而是三件事按序叠加**：先修串口错误恢复等必修缺陷（阶段 0），再在裸机上把上位机双向协议做完（阶段 1），然后为相机预留物理层无关的端口（阶段 2），最后在这三块都定型之后接入 RTOS（阶段 3）。
 **贯穿始终的三条纪律**：不碰 `Drivers/`、`Core/` 只写 `USER CODE` 段、新增源文件必须注册进 `CMakeLists.txt`。
+
+---
+
+## 10. 2026-10-21 安全改造记录（阶段 0 的一部分）
+
+背景：一次调试中，小车**所有指令突然失效**，随后车轮空转、电流过载，主电池 BMS 紧急切断供电。
+排查后确认这不是单行 bug，而是「开环脉冲 + 上电无条件自启动 + 阻塞运动 + 串口会静默失聪」四件事叠加出来的过载路径。
+本节记录这一轮改了什么、为什么改、怎么验证。
+
+### 10.1 四个成因与对应改动
+
+| # | 成因 | 后果 | 改动 |
+|---|---|---|---|
+| 1 | `Core/Src/main.c` 的 USER CODE 2 段**无条件**跑六段演示（13.25 s） | BMS 断电 → MCU 复位 → 又跑一遍 → 又断电，**正反馈**；且这 13 s 里 `App_Loop()` 一次都不执行 | 删除自启动，内容搬到 `Motion_Demo()`，由命令 `D` 触发 |
+| 2 | 运动动作阻塞（`Osal_DelayMs` 忙等），无任何中断点 | 一旦开始，跑到结束才回来；期间**发什么都没反应** | 等待改成每 8 ms 检查一次 `s_abort`；新增 `Motion_Stop()` 与急停快通道（中断里置标志，最迟 8 ms 停） |
+| 3 | `Service/Src/protocol.c` 在「上一帧未取走」时**丢弃所有新字节** | 只要上层卡过一次，串口就**永久失聪**直到复位 | 改为「新帧覆盖旧帧」；并用 `s_reading` 标志保护取帧期间的缓冲区 |
+| 4 | 没有 `HAL_UART_ErrorCallback` | 一次 ORE/FE 后 HAL 不再武装接收 → 同样永久失聪 | 新增回调：清 ORE/FE/NE + 清 `ErrorCode` + 重新 `HAL_UART_Receive_IT` |
+
+另外两个「容易把电机拖进失步」的实现级问题：
+
+| # | 问题 | 改动 |
+|---|---|---|
+| 5 | `bsp_motor_pulse.c` 在**定时器运行中**写 `EGR = TIM_EGR_UG`，把正在输出的脉冲强行截断，可能 <2.5 µs（M860D 要求高低电平各 ≥2.5 µs）→ 丢步 | 加 `CR1.CEN == 0` 守卫：**只有停着的定时器才写 UG**；运行中改 PSC 本来就会在下一个更新事件生效 |
+| 6 | `CFG_PUL_MAX_HZ` 是 100000，上位机一条命令就能把电机拖进高速失步 | 降到 **5000**；另加软件上限 `CFG_MOTION_MAX_SPEED_HZ`（调试期 **1200**，见 §11.4）与编译期 PSC 溢出断言 |
+
+### 10.2 改动文件清单
+
+| 文件 | 改动 |
+|---|---|
+| `Core/Src/main.c` | 删除六段自启动（USER CODE 2 段），去掉 `#include "motion.h"` |
+| `App/Src/motion.c` | 新增安全层：`s_abort` / `s_alive_ms` / `Motion_Stop` / `Motion_RequestAbort` / `Motion_ClearAbort` / `Motion_Aborted` / `Motion_NotifyAlive` / `Motion_Tick` / `Motion_IsMoving` / `Motion_Demo`；`Motion_WaitMs()` 可中断等待；`Motion_RampTo()` 内加急停检查；`Motion_Steer()` 加「换向必须先停」与速度/时长夹紧 |
+| `App/Inc/motion.h` | 上述接口声明 + 契约说明 |
+| `App/Src/app_init.c` | 从 TODO 变成完整命令解析（`E S ? H F L A D`）+ 急停快通道 `App_RxByte()` + `Motion_Tick()` 调用 |
+| `Service/Src/protocol.c` / `.h` | 「丢新字节」改「覆盖旧帧」；取帧期间用 `s_reading` 保护；`Protocol_TakeFrame` 返回 `u16` → `u8` |
+| `Bsp/Src/bsp_uart.c` | 新增 `HAL_UART_ErrorCallback()`（串口错误自动恢复） |
+| `Bsp/Src/bsp_motor_pulse.c` | `EGR` 写入加 `CEN == 0` 守卫 |
+| `Config/Inc/cfg_motor.h` | `CFG_PUL_MAX_HZ` 100000 → 5000；新增三条编译期断言（PSC 16 位、PSC 不得算出 0） |
+| `Config/Inc/cfg_motion.h` | 新增 `CFG_MOTION_MAX_SPEED_HZ` / `CFG_MOTION_MAX_RUN_MS` / `CFG_CMD_TIMEOUT_MS` / `CFG_MOTION_DIR_SETTLE_MS` |
+| `tools/syntax-check.sh` | 新增：不经 cmake/ninja，直接调 `arm-none-eabi-gcc -fsyntax-only` 做语法检查 |
+
+分层纪律没有破：App 层仍然不 include 任何 MX 头、不直接调 HAL 延时；`app_init.c` 仍是唯一集成点；`main()` 仍只调 `App_Init()` / `App_Loop()`。
+
+### 10.3 命令行编译（补充：RK8 已不成立）
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build.ps1            # 增量 Debug
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build.ps1 -Clean     # 全量
+```
+
+**必须带 `-ExecutionPolicy Bypass`**，否则 Windows 会因为「脚本未经数字签名」直接拒绝执行。
+本机实测通过（2026-10-21，工作区改名为 `E:\Phenotyping_robot\Motor_HAL_REBULD` 后重新 `-Clean` 全量编译）：
+`RAM 2536 B / 128 KB (1.93%)`、`FLASH 26700 B / 1 MB (2.55%)`（§11 补丁 + §11.4 保守调试档之后）。
+`build.ps1` 自己会在 `%LOCALAPPDATA%\stm32cube\bundles` 里找 cmake / ninja / **arm-none-eabi-gcc** 并临时拼 PATH，
+所以**工作区换目录、或 build 目录被删掉之后，直接 `-Clean` 就能重新配置**，不依赖 IDE 先建一次缓存。
+快速语法检查（不链接、几秒出结果，路径由脚本自身推导）：`bash tools/syntax-check.sh`。
+
+### 10.4 验收清单（上电前先做，别带轮子）
+
+- [ ] 上电后 **30 秒内四轮不应有任何动作**（以前上电就跑演示）
+- [ ] 串口发 `?` 有回包；发 `H` 有命令表
+- [ ] 发 `F1000` → 车轮转；**3 秒后自动停**（掉线保护）
+- [ ] 发 `F1000` 后立刻发 `E`（单字节）→ **应立即停**，不用回车
+- [ ] 发 `F2500` → 实际按 **1200 Hz** 跑（被 `CFG_MOTION_MAX_SPEED_HZ` 夹紧）；示波器看 `PUL+/PUL−`：1200 Hz、周期 833 µs、高电平 417 µs、**无窄毛刺**
+- [ ] 发 `F1000` 再发 `F-1000` → 能听到/看到「先停 300 ms 再反向」，而不是直接反转
+- [ ] 连发 20 条命令不丢、不串帧
+- [ ] 车在动的时候**拔掉串口线** → 3 秒内自动停
+- [ ] 发 `D` → 六段演示能跑完；中途发 `E` 能立刻打断
+
+### 10.5 本轮没有动的部分（在硬件侧，必须人工确认）
+
+这几条不改代码，但**直接决定上面所有改动有没有意义**：
+
+1. **M860D 顶上的滑拨开关必须拨到 5 V**（出厂默认 24 V）。STM32 走 3.3 V→5 V 电平转换板，
+   若滑拨还在 24 V，输入光耦几乎不导通：低频勉强能转、2500 Hz 必跟不上——正是「空转/嗡嗡响不转」。
+   ⚠️ 手册 §4.2 警告：控制信号 24 V 而滑拨在 5 V 会**烧驱动器**。**改滑拨前先把控制线拔掉。**
+2. **8 路电平转换板是 NMOS 开漏（BSS138 型）**：只能灌电流，高电平靠上拉电阻，10 kΩ ≈ 0.5 mA，
+   远低于 M860D 要求的 7~20 mA。所以**必须共阳接法**：`PUL+` / `DIR+` 接 5 V，`PUL−` / `DIR−` 接模块输出。
+   共阴接法一定不工作。共阳的副作用：信号极性反相（DIR 全反，改 `motion.c` 的方向宏即可）、上升沿慢 1~3 µs。
+3. **驱动器拨码**：`SW1~SW3` 动态电流（按电机额定值设，别图省事全 off）、`SW5~SW8` 细分建议 1600~6400、
+   **`SW9` 必须是「单脉冲 PUL+DIR」**（双脉冲模式会无法换向）。
+4. **`ALM` 报警线还没接**。M860D 的 ALM 是光耦集电极开路输出（≤30 VDC / 100 mA，正常时常开），
+   接一路 GPIO 就能让固件在过流/过压时第一时间停车——这是把「事后解释」变成「事中保护」的关键一步，建议下一轮做。
+5. 判断故障时先看驱动器红灯：**5 秒周期循环闪 1 次 = 过流报警、闪 2 次 = 过压报警、常亮 = 驱动器损坏**。
+
+---
+
+## 11. 2026-10-21 补丁：审计发现的四个残留问题
+
+背景：§10 的改造做完之后做了一轮逐文件审计，发现四条仍然存在的隐患。其中第 1 条会**直接让 §10.4 第 4 条验收项失败**。
+
+### 11.1 问题与改动
+
+| # | 问题 | 后果 | 落点与改动 |
+|---|---|---|---|
+| **Y1** | 急停在「主循环空闲」时不生效 | 发 `F1000` 后立刻发 `E`，车**还会再转约 3 秒**（要等 `Motion_Tick()` 超时），日志却打印 `ESTOP (hard)`，看起来像停了。只有 `E` 恰好落在阻塞动作里才立即生效 | `App_Loop()` 开头加兜底：`Motion_Aborted()` 且 `Motion_IsMoving()` → `Motion_Stop()`。非阻塞时延迟 < 1 ms |
+| **Y2** | 串口发送无超时（`HAL_MAX_DELAY`） | TC/TXE 一直不来（电平板接错、TX 被拉低）时 `LOG()` 永久阻塞 → 主循环停转 → `Motion_Tick()` 不再跑 → **车一直转**，正是那次故障的形态 | 新增 `Config/Inc/cfg_comm.h` 的 `CFG_UART_TX_TIMEOUT_MS = 5`；`Bsp_Uart_SendByte/SendBuf` 改用有限超时，超时丢字节并计数（`Bsp_Uart_GetTxDropCount()`，`?` 命令会打印 `TXDROP=`） |
+| **Y3** | `Protocol_TakeFrame()` 先放开中断再清状态 | 中间插进来的一个字节被 ISR 写入后又被清零 → 偶尔一条命令少第一个字符（`F1000` → `1000` → `ERR unknown`） | 改成**先 `s_rx_sta = 0`，再 `s_reading = 0`** |
+| **Y4** | 串口错误恢复只成功一次 | 错误回调里 `HAL_UART_Receive_IT()` 在 HAL 仍 BUSY 时静默失败 → 又回到「永久失聪」 | 回调里先 `HAL_UART_AbortReceive()` 再武装，并把结果落到 `s_rx_armed`；主循环用新增的 `Bsp_Uart_Service()` 兜底重试 |
+
+### 11.2 验收要点（相对 §10.4 的补充）
+
+- [ ] `F1000` 回车后**立刻**发单字节 `E` → 车轮应在**一瞬**（不是 3 秒）停下，并打印 `ESTOP (hard)`
+- [ ] 发 `?` 看 `TXDROP=`：链路正常时应恒为 `0`；若持续增长，说明 TX 方向有问题（先查电平转换板/共阳接法）
+- [ ] 连发 50 条 `?`，不应出现任何一条回包首字符丢失
+- [ ] 故意短路 TX（或拔掉收发器）后仍能收到 `ESTOP`（主循环不再被发送卡死）
+
+### 11.3 改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `App/Src/app_init.c` | `App_Loop()` 加急停兜底与 `Bsp_Uart_Service()`；`?` 增加 `TXDROP=`；命令表注释同步 |
+| `Bsp/Src/bsp_uart.c` | 发送加超时与丢弃计数；`Bsp_Uart_Rearm()` 集中武装逻辑；错误回调先 `AbortReceive` |
+| `Bsp/Inc/bsp_uart.h` | 新增 `Bsp_Uart_Service()` / `Bsp_Uart_GetTxDropCount()` 声明与契约说明 |
+| `Service/Src/protocol.c` | 取帧时先清状态再放开中断 |
+| `Config/Inc/cfg_comm.h` | **新增**：链路层常量（发送超时），不新增 `.c`，无需改 `CMakeLists.txt` |
+
+### 11.4 保守调试档（2026-10-21 晚，配合上机调试）
+
+用户要求「先按最安全保守的方式改，先调试几轮」。所以把安全包络整体收紧一档，
+目的不是跑得快，而是**任何一次误操作都不至于再把电流推过 BMS 的跳闸点**。
+
+| 参数 | 改前 | 改后 | 理由 |
+|---|---|---|---|
+| `CFG_MOTION_MAX_SPEED_HZ` | 3000 | **1200** | 回到方案原文的「先保守，验证后再提」。1200 Hz @1600 细分 ≈ 45 rpm，够看趋势、电流小 |
+| `CFG_SCURVE_ACCEL_HZ_PER_S` | 2000 | **1000** | 起步更柔和：0→1200 用 1200 ms，瞬时加速电流减半，最不容易丢步/堵转 |
+| `CFG_PUL_MAX_HZ` | 5000 | 5000（不变） | 硬件层上限，软件上限 1200 已经压在它下面 |
+| `CFG_MOTION_MAX_RUN_MS` | 5000 | 5000（不变） | 单段动作硬上限，演示第 5 段换向约 2.7 s，仍有余量 |
+| `CFG_CMD_TIMEOUT_MS` | 3000 | 3000（不变） | 掉线 3 秒自动停；调试时若觉得太短可临时改大（**不建议关**） |
+| `CFG_MOTION_DIR_SETTLE_MS` | 300 | 300（不变） | 远大于手册要求的 DIR 提前 5 µs |
+
+**提档阶梯**（每档跑通再下一档，只改 `cfg_motion.h` 两行，不碰其他代码）：
+
+| 档 | `MAX_SPEED_HZ` | `ACCEL_HZ_PER_S` | 通过条件 |
+|---|---|---|---|
+| 调试档（当前） | 1200 | 1000 | 四轮空载不丢步；带轮能起步；`F1000` 3 秒自动停；`E` 一瞬停；拔串口 3 秒停 |
+| 进阶档 | 2000 | 1500 | 上一档全部通过 + 示波器看脉冲无窄毛刺 + 驱动器无红灯 |
+| 正式档 | 3000 | 2000 | 上一档全部通过 + 连续跑 10 分钟母线电压不塌 + 电机温度正常 |
+
+> 调试期还有一条硬规矩：**首次上电一定先垫起车轮（悬空）**，挡住轮子让车跑是看不出来堵转的。
+
+> 仍然没做：§10.5 的硬件侧 5 条。`D` 演示全长约 12 秒且期间不跑 `Motion_Tick()`，所以**演示中途拔线不会被看门狗拦下**——
+> 按 `E` 仍可立即打断（Y1 之后对空闲态也成立）。
+
+---
+
+## 11.5 2026-10-21 补丁二：X2 / X3 / X5 / X6（§9.4 收口）
+
+### 11.5.1 为什么现在做
+
+这四条原本排在「上 RTOS 之前处理」。触发点很具体：排查「PC 发命令、板子收不到」时，
+发现 `bsp_uart.c` 里所有接收状态都是**单实例**（`s_rx_armed` 这样一个全局变量），
+一旦按路线三加相机串口（USART2/USART6），两路共用一个标志必然互相踩。
+与其等加串口时返工，不如先把分发结构搭好——X2 做的就是这件事。
+
+> 顺带说明那条串口故障的结论：用 SWD 直接读寄存器 + 把命令直接写进接收缓冲区做过注入测试，
+> **固件的接收链路（协议状态机 → 命令解析 → 运动执行）是通的**，
+> `GPIOA`/`USART1`/`NVIC`/向量表全部正确。所以问题在板外的物理链路，与本轮改动无关。
+
+### 11.5.2 X2 串口回调按 `Instance` 分发
+
+`Bsp/Src/bsp_uart.c` 从「单通道 + 全局状态」改成**通道表**：
+
+```c
+typedef struct {
+    UART_HandleTypeDef    *huart;    /* 本通道绑定的 HAL 句柄 */
+    u8                     rx_byte;  /* RxCplt 落点 */
+    Bsp_Uart_RxByteHandler handler;  /* 字节回调（App 层注册） */
+    volatile u8            armed;    /* 接收已武装 */
+} Bsp_Uart_Channel;
+
+static Bsp_Uart_Channel s_ch[CFG_UART_RX_CHANNELS];  /* 默认 2 */
+```
+
+| 接口 | 作用 | 变化 |
+|---|---|---|
+| `Bsp_Uart_OpenChannel(huart, handler)` | 注册一路串口，返回 0/1/2（0=占用 1=形状错 2=表满） | **新增**，加相机串口时只调它 |
+| `Bsp_Uart_SetRxByteHandler(h)` | 给**主机口**设字节回调 | 保留，语义不变 |
+| `Bsp_Uart_RxStart()` | 武装所有已注册通道 | 保留，语义不变 |
+| `Bsp_Uart_Service()` | 只补装没武装上的通道（X1 兜底） | 保留 |
+| `Bsp_Uart_IsArmed()` | 主机口是否武装（排查用） | 改名自内部 `s_rx_armed` |
+
+回调分发：
+
+```c
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    const Bsp_Uart_Channel *c = Bsp_Uart_Find(huart);
+    if (c == 0 || c->handler == 0) return;   /* 不认识的口：吃掉，不误分发 */
+    c->handler(c->rx_byte);
+}
+```
+
+- 头文件里 `huart` 参数用 `void *`，**不让 App/Service 层看到 `UART_HandleTypeDef`**（架构红线 §2.1）。
+- 通道数由 `Config/Inc/cfg_comm.h` 的 `CFG_UART_RX_CHANNELS` 控制，每通道约 16 字节 RAM。
+
+### 11.5.3 X3 NVIC 分组改 GROUP_4
+
+| 位置 | 改前 | 改后 |
+|---|---|---|
+| `Core/Src/stm32f4xx_hal_msp.c` | `NVIC_PRIORITYGROUP_2` | **`NVIC_PRIORITYGROUP_4`**（4 位抢占、无子优先级） |
+| `Core/Src/usart.c` | `HAL_NVIC_SetPriority(USART1_IRQn, 3, 3)` | `(USART1_IRQn, 3, 0)` |
+| `Core/Inc/stm32f4xx_hal_conf.h` | `TICK_INT_PRIORITY 3U` | `15U`（SysTick 降到最低级） |
+
+原因：FreeRTOS 的 `vPortValidateInterruptPriority()` 只接受 GROUP_4；GROUP_2 下
+「同抢占级靠子优先级排队」在 RTOS 语义里是错的，且断言信息不直观，容易白耗一天。
+
+改完后 USART1 抢占级 3 高于 SysTick 的 15，串口 ISR 可以打断毫秒节拍，方向是对的。
+
+> 上 RTOS 时还要动的地方（现在**没有**做，别提前改）：`USE_RTOS` 仍为 `0U`，
+> FreeRTOS 自己接管 SysTick 并设置 `configKERNEL_INTERRUPT_PRIORITY`。
+
+### 11.5.4 X5 新增两个配置头
+
+| 文件 | 内容 |
+|---|---|
+| `Config/Inc/cfg_rtos.h` | 任务栈（Motion 256 / Comm 384 / Log 256 / Idle 128，单位字）、优先级（Motion 4 > Comm 3 > Log 1 > Idle 0）、队列长度（命令 8 / 日志 16）、`CFG_RTOS_TICK_HZ 1000`、`CFG_RTOS_MAX_SYSCALL_PRIO 5`、看门狗 `2000 ms` |
+| `Config/Inc/cfg_cam.h` | 相机串口波特率 `115200`、单帧上限 `64`、超时 `200 ms`、输出周期 `50 ms`、标定（`MM_PER_PX 35/100`）、画面中心偏移、最小目标面积 `200`、连续丢帧判丢 `3` |
+
+只放**常量**，不含代码；与 `cfg_motion.h`/`cfg_motor.h`/`cfg_comm.h` 同一风格。
+数值来自路线三的设计稿，改动时只改这一处。
+
+### 11.5.5 X6 故障现场输出
+
+新增 `Bsp/Src/bsp_fault.c` + `Bsp/Inc/bsp_fault.h`，接到两个裸 `while(1)` 上：
+
+| 挂点 | 输出 |
+|---|---|
+| `Core/Src/main.c` `Error_Handler()` | `FAULT ERROR pc=0800XXXX`（调用者的返回地址）+ `addr2line` 用法提示 |
+| `Core/Src/stm32f4xx_it.c` `HardFault_Handler()` | `FAULT HARDFAULT` + `PC LR xPSR` + `CFSR HFSR MMFAR BFAR` + `R0-R3 R12` |
+
+三个关键设计：
+
+1. **不依赖 HAL 也不用中断**。故障时 SysTick 和 UART ISR 都可能已经死了，所以直接用寄存器
+   轮询 `USART1->SR.TXE` / 写 `DR`，每字节最多等 200000 次空转（不设上限就会永久卡在发送里）。
+2. **栈选对**。`HardFault_Handler` 用内联汇编按 `EXC_RETURN`（LR）的 bit2 取 MSP 或 PSP，
+   取错栈只会打出一堆 `0`。以后上 RTOS，任务里的故障走 PSP，这里已经能取对。
+3. **`__BKPT` 有条件**。只有调试器挂着（`DHCSR.C_DEBUGEN=1`）才执行 `BKPT 0`，
+   否则独立运行时会立刻变成 HardFault 死循环。
+
+典型用法：拿到 `pc=` 后
+```bash
+arm-none-eabi-addr2line -e build/Debug/Motor_HAL_REBULD.elf 0x08001234
+```
+直接定位到 `xxx.c:行号`。
+
+> 验收方式（不影响正常调试）：在调试器里对 `Bsp_Fault_DumpError` 下断点，然后
+> `-exec call Bsp_Fault_DumpError(0x08000000)` 手动触发一次，串口应出现 `FAULT ERROR ...`。
+
+### 11.5.6 验收与资源
+
+| 检查 | 结果 |
+|---|---|
+| 编译（`tools/build.ps1`） | **通过**，无 warning |
+| FLASH | 27816 B / 1 MB（**2.65%**，+1112 B：`bsp_fault.c` 的格式化与字符串） |
+| RAM | 2560 B / 128 KB（**1.95%**，+24 B：通道表） |
+| `tools/syntax-check.sh` | 通过 |
+
+**调试观测表要改一处**：原来在 watch 里看 `s_rx_armed`，现在是 `s_ch[0].armed`；
+如果用 GDB 命令，写 `print s_ch[0].armed`。
+
+仍未做：§10.5 硬件侧 5 条；`USE_RTOS`/FreeRTOS 本体（路线四）与相机端口（路线三）本身。
+
+### 11.6 调试开关 `CFG_DEBUG_AUTOTEST`（默认关闭）
+
+**为什么要有它**：本机调试器是 STM32Cube 的 GDB 适配器（`stgdbtarget`）。它的调试控制台
+对函数调用求值有硬性限制——`.../stm32cube-ide-debug-generic-gdbserver/lib/adapter/GenericDebugTargetAdapter.js:3859`
+先检查 `frameId`，拿不到就直接抛 `Evaluation of expression without frameId is not supported`，
+连 `>` 控制台命令也过不了这一关（检查在命令分发之前）。而且前缀是 `>`（`>-` 表示原样发 MI 命令），
+**不是** cortex-debug 那套 `-exec`。
+
+所以串口命令通道不通时，留一条**完全绕开调试器 `call`** 的路：改一个数字、重编译、F5。
+
+`Config/Inc/cfg_debug.h`：
+
+| 编号 | 上电自动执行的动作 |
+|---|---|
+| 0 | **关闭（默认，不生成任何代码）** |
+| 1 | `Motion_Drive(1200, 0)` 加速到顶并保持 |
+| 2 | `Motion_Drive(1200, 3000)` 加速 + 保持 3 s |
+| 3 | `Motion_Steer(600, -600, 3000)` 原地左转（差速 200%） |
+| 4 | `Motion_Demo()` 六段演示（前进→右转→回正→前进→倒车→停） |
+| 5 | `Motion_Drive(2500, 0)` 限幅验证，应读回 1200 |
+| 6 | 正转 1 s 后立刻反转，看换向时序 |
+| 7 | **武装看门狗 + 保持 1200，自己不停车** —— 专门验证掉线保护：3 秒后应由 `Motion_Tick()` 自动停下；若一直转 = 掉线保护失效 |
+
+执行点在 `App_Init()` 末尾（`READY` 打印之后、`App_Loop()` 之前），等价于"上电就收到一条命令"。
+
+> ⚠️ 打开后会**上电自动驱动电机**，编译时会有 `#warning` 提示。调试完必须改回 0。
+> 首次使用一律先垫起四轮。
+> 实测开销：编号 0 时 FLASH 30816 B（含串口诊断计数）；编号 4 时 +80 B 左右。
+
+**在调试器里手动调函数的正确姿势**（能拿到帧时可用）：
+
+1. 在 `App/Src/app_init.c` 的 `App_Loop()` 里下断点，F5 停下来；
+2. 在左侧 **CALL STACK** 里点一下最上面那一帧（这就是给它 `frameId`）；
+3. 控制台输入 `>call Motion_Drive(1200, 0)`，回车后再 `>continue`。
+
+三处常见误写：漏掉开头的 `>`（会被当 C 表达式求值）、写成 `-exec call ...`（那是别的插件）、
+目标还在运行/没选中帧（就算有 `>` 也会报 frameId）。
+
+**第四条，实战里最容易踩的**：`call` 每执行一次，目标状态就变一次，适配器缓存的栈帧句柄随之失效
+（`this.frameHandles`），VS Code 侧记录的“当前选中帧”跟着作废。所以不是“点一次帧就够”，而是
+**每敲一条 `call` 之前都要重新在 `调用堆栈` 里点一下最上面那帧**。症状就是上一句成功、下一句突然
+报 `Evaluation of expression without frameId is not supported`。
+
+**不要按板载复位键**：调试进行中按复位，芯片自己重启而 GDB 仍以为停在原断点，随后会连续出现
+`target was not halted when resume was requested` / `context restore failed, aborting resume`，
+所有 `call` 全部失败。要复位就用工具栏的 ⟲（Restart），GDB 能同步。另外复位后 `s_alive_ms` 归零，
+看门狗自动退出武装状态——**此时若车还在转，它会一直转下去**。
+
+### 11.7 上机实机记录（2026-10-21 晚）
+
+**环境**：ATK 无线调试器（CMSIS-DAP，`ATK-HSWL-CMSIS-DAP`）+ VS Code STM32Cube 扩展；
+串口监视器挂在无线调试器接收器的虚拟串口 COM22 上，**TX（板→PC）通，RX（PC→板）不通**，
+所以本轮验收全部走调试器调用，不依赖串口命令。
+
+**已实测通过**
+
+| 项 | 结果 |
+|---|---|
+| 上电不自动动作（§10 安全改造） | ✅ 停在 `main()` 后继续，四轮静止，直到主动下命令 |
+| `Motion_Drive(1200, 0)` 直行 | ✅ 四轮同向同速前进 |
+| `Motion_Demo()` 六段演示（右转版） | ✅ 顺序与方向全对：前进→右转→回正→前进→倒车→停 |
+| 演示结束速度归零 | ✅ `s_speed_left == s_speed_right == 0`，脉冲定时器已 `HAL_TIM_Base_Stop()` |
+| 停车后电机“嗡”声 | ✅ 正常：固件不控制 M860D 的 ENA（硬接常使能），保持电流引起的磁致伸缩噪声 |
+
+**尚未实测**（结论未定，不要当成已通过）
+
+- 通信看门狗 3 秒自停：多次尝试因 GDB `frameId` 报错未真正下发命令，属**空测**；
+- 限幅 2500 → 1200：未用示波器量 PA0/PE9，仅目视同速；
+- 急停 `E`、拔线自停、连发 50 条不丢帧：依赖串口 RX 方向，**RX 未打通，全部未测**；
+- §11.2 的四条、§10.5 的五条硬件项：均未做。
+
+**遗留的硬件侧疑点**：串口 PC→板方向无响应。已排除固件侧（§11.5 的 X2/X3 已验证
+`s_ch[0].armed == 1`、`USART1->CR1` 的 RXNEIE/UE 均置位、NVIC ISER1 bit5 已使能、
+PA9/PA10 均为 AF 模式且 RX 空闲高电平），故障在板外链路或无线透传模式。
+
+**待办（新增）**
+
+- `X7`：把 M860D 的 `ENA` 引到 GPIO，静止 N 秒后断使能，消除保持电流嗡声（代价：失去保持转矩，
+  外力可推动轮子；且当前硬件未接这根线）。
+
+### 11.8 串口“发出去没反应”怎么一刀切
+
+新增两个纯读诊断计数（`Bsp/Inc/bsp_uart.h`）：
+
+| 接口 | 含义 |
+|---|---|
+| `Bsp_Uart_GetRxTotal()` | 收到的字节总数（`HAL_UART_RxCpltCallback` 里累加） |
+| `Bsp_Uart_GetRxErrorCount()` | 线路错误次数（`HAL_UART_ErrorCallback` 里累加） |
+
+判读表：
+
+| 现象 | 结论 | 下一步 |
+|---|---|---|
+| `RX_TOTAL == 0`，而你一直在发 | **字节根本没到 MCU** | 查接线/透传模式/电平转换，别动固件 |
+| `RX_TOTAL > 0`，但仍无反应 | 字节到了，卡在帧状态机或命令解析 | 查 CRLF、查 `Protocol_FeedByte` |
+| `RX_ERR` 持续增长 | 线路质量差（ORE/FE/NE） | 先查线，再怀疑波特率 |
+
+用法（调试器，注意每条 `call`/`print` 前重新点栈帧）：
+
+```
+>-interpreter-exec console "print Bsp_Uart_GetRxTotal()"
+```
+
+`print` 类求值不受"函数调用"限制，一般不需要切到运行态；若报 `frameId`，重新点一下
+`调用堆栈` 最上面那帧即可。
+
+**当前状态**：`RX_TOTAL` 尚未测量（计数器是本次新增的）。但固件侧已逐项排除——
+`s_ch[0].armed == 1`、`USART1->CR1` 的 `RXNEIE`/`UE` 均置位、NVIC `ISER1` bit5 已使能、
+`PA9/PA10` 均为 AF 模式、`PA10` 空闲高电平、`BRR = 0x2D9`（84 MHz 下 115200 正确）。
+因此故障在板外的无线透传链路。下一步：发命令后读 `RX_TOTAL`，
+为 0 即坐实“字节没到 MCU”。
