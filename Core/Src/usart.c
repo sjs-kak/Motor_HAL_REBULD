@@ -80,8 +80,11 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* USART1 interrupt Init */
-    HAL_NVIC_SetPriority(USART1_IRQn, 3, 3);
+    /* USART1 interrupt Init
+     * X3：NVIC 分组已改为 GROUP_4（4 位抢占、无子优先级），
+     *     所以第三参数（子优先级）必须是 0；抢占级 3 保持原值不变，
+     *     高于 SysTick(15)、低于 HardFault。 */
+    HAL_NVIC_SetPriority(USART1_IRQn, 3, 0);
     HAL_NVIC_EnableIRQ(USART1_IRQn);
   /* USER CODE BEGIN USART1_MspInit 1 */
 

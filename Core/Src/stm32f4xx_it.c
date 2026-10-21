@@ -22,6 +22,7 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "bsp_fault.h"   /* X6：HardFault 现场输出 */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -86,7 +87,26 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
+  /* X6：把压栈现场导出来再停机。
+   *
+   * 取哪一栈由 EXC_RETURN（LR）的 bit2 决定：
+   *   bit2 = 0 → 异常发生在使用 MSP 的上下文（复位后、中断里）
+   *   bit2 = 1 → 使用了 PSP（以后上 RTOS，故障发生在某个任务里）
+   * 取错栈会打出一堆 0，等于没打。
+   *
+   * frame[0..7] = R0,R1,R2,R3,R12,LR,PC,xPSR —— 这是硬件自动压栈的布局，
+   * 只要 FPU 没参与（CONTROL.FPCA=0 或未用 FPU 指令），布局就是这 8 个字。 */
+  u32 *frame;
 
+  __asm volatile (
+      " tst   lr, #4        \n"
+      " ite   eq            \n"
+      " mrseq %0, msp       \n"
+      " mrsne %0, psp       \n"
+      : "=r" (frame)
+  );
+
+  Bsp_Fault_DumpHardFault(frame);   /* 不返回 */
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {

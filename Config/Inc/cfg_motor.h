@@ -16,9 +16,28 @@
 /* PWM 载波：固定 ARR，靠改 PSC 调频 */
 #define CFG_PUL_ARR         100
 
-/* 脉冲频率限幅 */
+/* 脉冲频率限幅
+ *
+ * 上限 5000Hz 的依据（不是随便定的）：
+ *   - 2500Hz @1600 细分 ≈ 94rpm；5000Hz ≈ 188rpm，已经够用；
+ *   - M860D 要求脉冲高低电平各 ≥2.5µs，也就是理论上限 200kHz，
+ *     但真正卡住的是光耦（TLP 型输入 7~20mA、开关速度有限）
+ *     和"频率越高电机越容易失步 → 电流上升"这个过载路径。
+ *   - 旧值 100000Hz 会让上位机一条 FR100000 直接把电机拖进失步状态。
+ */
 #define CFG_PUL_MIN_HZ      30
-#define CFG_PUL_MAX_HZ      100000
+#define CFG_PUL_MAX_HZ      5000
+
+/* --- 编译期自检：PSC 是 16 位，超了就静默截断，转速会错得莫名其妙 ----- */
+#if ((CFG_TIM1_CLK_HZ / (CFG_PUL_MIN_HZ * CFG_PUL_ARR)) > 65536UL)
+#error "CFG_PUL_MIN_HZ 太低：TIM1 的 PSC 超过 16 位，会被静默截断"
+#endif
+#if ((CFG_TIM2_CLK_HZ / (CFG_PUL_MIN_HZ * CFG_PUL_ARR)) > 65536UL)
+#error "CFG_PUL_MIN_HZ 太低：TIM2 的 PSC 超过 16 位，会被静默截断"
+#endif
+#if (CFG_PUL_MAX_HZ > (CFG_TIM2_CLK_HZ / CFG_PUL_ARR))
+#error "CFG_PUL_MAX_HZ 太高：会算出 0 或负的 PSC（最低可到 tim_clk/ARR）"
+#endif
 
 /* 电机编号（车体语义，不是通道号） */
 #define CFG_MOTOR_FL        0

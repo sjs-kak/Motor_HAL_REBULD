@@ -25,7 +25,7 @@ void Protocol_FeedByte(u8 byte);
  *   out/outSize 上层提供的缓冲区；len 返回帧长（可为 0/NULL）
  *   返回 1 = 取到一帧（out 已补 '\0'），0 = 还没收到完整帧
  * ------------------------------------------------------------------------ */
-u16 Protocol_TakeFrame(char *out, u16 outSize, u16 *len);
+u8 Protocol_TakeFrame(char *out, u16 outSize, u16 *len);
 
 /* 丢弃当前半帧，重新开始收 */
 void Protocol_Reset(void);

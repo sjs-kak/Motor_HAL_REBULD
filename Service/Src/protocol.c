@@ -14,11 +14,27 @@
 static u8  s_rx_buf[PROTOCOL_FRAME_MAX];
 static u16 s_rx_sta = 0;
 
+/* 主循环正在把 s_rx_buf 拷到调用者缓冲区时置 1。
+ * 期间中断里收到的字节直接丢掉 —— 宁可丢一个字节（这一帧作废），
+ * 也不能让中断在拷到一半的时候把缓冲区改掉（那样取出来的命令是坏的）。 */
+static volatile u8 s_reading = 0;
+
 void Protocol_FeedByte(u8 byte)
 {
-    if ((s_rx_sta & 0x8000) != 0)           /* 上一帧还没被取走：丢弃新字节 */
+    if (s_reading != 0)                     /* 主循环正在取帧：本字节丢弃 */
     {
         return;
+    }
+
+    /* 上一帧还没被取走：**丢弃旧帧，让新数据进来**。
+     *
+     * 旧实现是"丢掉所有新字节"，一旦上层因为跑动作卡住、没及时 TakeFrame，
+     * 串口就会永久失聪——上位机看到的正是"发什么都没反应"。
+     * 现在改成"新的覆盖旧的"：宁可丢一帧旧命令，也不能停止收数据。
+     * 这些语句都在中断上下文，读写 s_rx_sta 是单字操作，不会被撕裂。 */
+    if ((s_rx_sta & 0x8000) != 0)
+    {
+        s_rx_sta = 0;
     }
 
     if ((s_rx_sta & 0x4000) != 0)           /* 已经收到 0x0D，等 0x0A */
@@ -50,7 +66,7 @@ void Protocol_FeedByte(u8 byte)
     }
 }
 
-u16 Protocol_TakeFrame(char *out, u16 outSize, u16 *len)
+u8 Protocol_TakeFrame(char *out, u16 outSize, u16 *len)
 {
     u16 n;
     u16 i;
@@ -73,6 +89,7 @@ u16 Protocol_TakeFrame(char *out, u16 outSize, u16 *len)
         n = (u16)(outSize - 1);
     }
 
+    s_reading = 1;                           /* 拷贝期间不许中断动缓冲区 */
     for (i = 0; i < n; i++)
     {
         out[i] = (char)s_rx_buf[i];
@@ -84,7 +101,15 @@ u16 Protocol_TakeFrame(char *out, u16 outSize, u16 *len)
         *len = n;
     }
 
+    /* ⚠️ 顺序：**先清状态，再放开中断**。
+     *
+     * 反过来的话，在 `s_reading = 0` 和 `s_rx_sta = 0` 之间插进来的那个字节
+     * 会被中断写进缓冲区（此时 s_rx_sta 仍是 0x8000|n，中断会先把它清零再存），
+     * 紧接着又被这一行的清零抹掉 —— 表现就是"偶尔一条命令少了第一个字符"
+     * （F1000 变成 1000，回 ERR unknown）。 */
     s_rx_sta = 0;                            /* 清标志，准备收下一帧 */
+    s_reading = 0;
+
     return 1;
 }
 

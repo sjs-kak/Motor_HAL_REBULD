@@ -79,7 +79,9 @@ target_link_libraries(osal PUBLIC cfg stm32cubemx)
 
 # ---- Bsp：唯一懂"这块板子"的一层（唯一允许 include tim.h/usart.h/gpio.h）----
 add_library(bsp OBJECT
+    Bsp/Src/bsp_fault.c
     Bsp/Src/bsp_motor_pulse.c
+    Bsp/Src/bsp_rc.c
     Bsp/Src/bsp_uart.c
 )
 target_include_directories(bsp PUBLIC
@@ -100,6 +102,7 @@ target_link_libraries(service PUBLIC bsp)
 # ---- App：唯一知道"这是一台表型检测车"的一层 ----
 add_library(app OBJECT
     App/Src/app_init.c
+    App/Src/app_rc.c
     App/Src/motion.c
 )
 target_include_directories(app PUBLIC

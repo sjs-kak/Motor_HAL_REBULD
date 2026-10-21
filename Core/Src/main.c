@@ -25,7 +25,12 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "app.h"          /* App 层唯一入口: App_Init() / App_Loop() */
-#include "motion.h"       /* 运动学 API: Motion_Drive / Motion_Steer / Motion_Brake */
+/* 注：main() 不再直接调 Motion_*。所有运动都由 App 层的串口命令触发，
+ *     需要看接口请翻 App/Inc/motion.h。 */
+
+/* 故障现场输出（X6）：Error_Handler / HardFault 里把现场打出来再停机，
+ * 而不是静默 while(1) —— 偶发故障重现不了，现场不打出来就永远查不到。 */
+#include "bsp_fault.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -95,16 +100,15 @@ int main(void)
   /* USER CODE BEGIN 2 */
   App_Init();                 /* 串口接收 + 四电机初始化（全部在 App 层） */
 
-  /* 六段动作：所有变速都走 S 曲线（斜率 = CFG_SCURVE_ACCEL_HZ_PER_S，
-   * 默认 2000Hz/s，即 0→2500Hz 用 1250ms），到达目标后再保持指定毫秒数。
-   * 变速过程中消耗的时间不算在保持时间里。
-   * 每段参数：Motion_Drive(速度, 保持ms) / Motion_Steer(左, 右, 保持ms) */
-  Motion_Drive( 2500,          1000);   /* 1) 从零起步：直行加速到 2500Hz，保持 1s */
-  Motion_Steer( 1000,  2500,   1000);   /* 2) 左转：左轮 1000Hz、右轮 2500Hz，保持 1s */
-  Motion_Steer( 2500,  1000,   1000);   /* 3) 回正：左轮 2500Hz、右轮 1000Hz，保持 1s */
-  Motion_Drive( 2500,          1000);   /* 4) 前进：回到两侧 2500Hz，保持 1s */
-  Motion_Drive(-2500,          2000);   /* 5) 减速后退：穿零换向到 -2500Hz，保持 2s */
-  Motion_Brake();                       /* 6) 停车：两侧 S 曲线降到 0 */
+  /* ⚠️ 这里曾经无条件跑六段演示（约 13 秒），已删除。
+   *
+   * 为什么必须删：
+   *   ① 上电就跑四轮 → 一旦 BMS 因为过流切断供电，MCU 掉电复位 →
+   *      复位后又跑一遍演示 → 又过流 …… 形成"断电极易反复触发"的正反馈；
+   *   ② 这 13 秒里 App_Loop() 一次都不执行，串口命令全部收到但没人处理。
+   *
+   * 现在上电静止，等上位机命令。需要演示请发 "D"（内容一字未改，
+   * 见 App/Src/motion.c 的 Motion_Demo()）。 */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -197,8 +201,19 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+  /* X6：先把"是谁失败的"打出来，再停机。
+   *
+   * 打印的是**返回地址**（调用 Error_Handler 的那一行在哪个函数里），
+   * 拿这个地址去查符号就知道是哪个 HAL 初始化失败了：
+   *   arm-none-eabi-addr2line -e build/Debug/Motor_HAL_REBULD.elf 0x08001234
+   *
+   * 注意顺序：先关中断再打印。关中断后串口发送靠轮询 TXE（见 bsp_fault.c），
+   * 不依赖 SysTick，所以关中断也能把字发完。 */
+  u32 caller = (u32)__builtin_return_address(0);
+
   __disable_irq();
+  Bsp_Fault_DumpError(caller);
+
   while (1)
   {
   }

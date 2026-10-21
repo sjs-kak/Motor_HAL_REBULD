@@ -148,7 +148,12 @@
   * @brief This is the HAL system configuration section
   */
 #define  VDD_VALUE		      3300U /*!< Value of VDD in mv */
-#define  TICK_INT_PRIORITY            3U   /*!< tick interrupt priority */
+/* X3 连带修正：NVIC 分组改成 GROUP_4（全 4 位抢占）之后，原来这里的 3U
+ * 会让 SysTick 拿到和 USART1 相同的抢占级(3)，两者互相不能打断，
+ * 而且将来上 FreeRTOS 时 SysTick 必须是**最低**抢占级。
+ * 15U = 最低（0 最高）。副作用只有一个：SysTick 不再能打断 USART1 ISR，
+ * 但 USART1 ISR 只有几十条指令，HAL_GetTick 的毫秒精度不受影响。 */
+#define  TICK_INT_PRIORITY            15U  /*!< tick interrupt priority */
 #define  USE_RTOS                     0U
 #define  PREFETCH_ENABLE              1U
 #define  INSTRUCTION_CACHE_ENABLE     1U
