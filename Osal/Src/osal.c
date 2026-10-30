@@ -15,3 +15,17 @@ u32 Osal_GetTickMs(void)
 {
     return HAL_GetTick();
 }
+
+u32 Osal_EnterCritical(void)
+{
+    u32 key = __get_PRIMASK();
+    __disable_irq();
+    __DMB();
+    return key;
+}
+
+void Osal_ExitCritical(u32 key)
+{
+    __DMB();
+    __set_PRIMASK(key);
+}

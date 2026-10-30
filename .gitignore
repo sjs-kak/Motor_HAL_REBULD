@@ -31,6 +31,12 @@ cmake-build-*/
 gdbClient_log.txt
 *.log
 
+# ---- 文档导出物 ---------------------------------------------------
+#  README.pdf 是 README.md 的导出件（里面有 PDF 生成器写的元数据），
+#  每次重新导出都产生一个巨大 diff，且二进制冲突无法手工合并。
+#  需要读的时候自己从 README.md 导出即可，不进仓库。
+README.pdf
+
 # ---- clangd / IntelliSense 缓存 -----------------------------------
 .cache/
 compile_commands.json

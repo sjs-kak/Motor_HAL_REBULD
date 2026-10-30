@@ -2,6 +2,7 @@
 #include "bsp_motor_pulse.h"
 #include "osal.h"
 #include "cfg_motion.h"
+#include "cfg_motor.h"   /* CFG_PUL_MAX_HZ：遥控通道的硬件上限 */
 
 /* ============================================================================
  * App 层 — 运动控制
@@ -64,6 +65,22 @@ static s32 s_speed_right = 0;
  * 默认 2000 == "1000Hz 用 500ms"；运行时可调，见 Motion_SetAccel()。 */
 static u32 s_accel_hz_per_s = CFG_SCURVE_ACCEL_HZ_PER_S;
 
+/* ---------------------------------------------------------------------------
+ * 非阻塞遥控通道的私有状态（见 motion.h 第 ⑤ 组）
+ *
+ *   s_target_*      遥控"想要"的速度。只由 Motion_SetTarget() 写。
+ *   s_slew_ms       上次推进斜坡的时间戳。
+ *   s_slew_fraction 上一步不足 1Hz 的余数（Hz×1000），累积到下一步。
+ *
+ * 为什么余数要累积：加速度 1000Hz/s、节拍 8ms → 每步只有 8Hz，(8×1000)/1000
+ * 正好整除；但只要把加速度调成 100Hz/s，每步就只剩 0.8Hz，整数截断后
+ * **永远到不了目标**（一直差最后 1Hz），而 1Hz 在低频段就是明显的台阶。
+ * ------------------------------------------------------------------------ */
+static s32 s_target_left    = 0;
+static s32 s_target_right   = 0;
+static u32 s_slew_ms        = 0;
+static u32 s_slew_fraction  = 0;
+
 /* 急停请求标志：只由 Motion_RequestAbort() 置位（可能在中断里），
  * 由 Motion_ClearAbort() 清零。等待循环每 8ms 读一次。 */
 static volatile u8 s_abort = 0;
@@ -75,11 +92,20 @@ static volatile u32 s_alive_ms = 0;
  * 内部工具
  * ------------------------------------------------------------------------ */
 
-/* 统一速度限幅（软件上限，比硬件上限更紧） */
+/* 统一速度限幅：以**硬件能出的最高频** CFG_PUL_MAX_HZ 为上限。
+ *
+ *   为什么不卡 CFG_MOTION_MAX_SPEED_HZ(1200)：那是调试期的保守软件档，
+ *   只该作为"上位机无人值守时"的建议值，不该让摇杆推到底也只出 1200Hz。
+ *   遥控映射出来的峰值（CFG_RC_MAX_SPEED_HZ）本来就按 2500 设计，
+ *   一旦在这里被砍到 1200，手感会变成"摇杆后半程全无响应"。
+ *
+ *   注意两侧共用这一条限幅：阻塞命令（Motion_Drive/Steer）与遥控
+ *   （Motion_SetTarget→Motion_SlewTick→Motion_Move）最终都落到 Motion_Move，
+ *   同一套硬件就必须同一套上下限，否则两条路的行为会不一致。 */
 static s32 Motion_Clamp(s32 v)
 {
-    if (v >  (s32)CFG_MOTION_MAX_SPEED_HZ) { return  (s32)CFG_MOTION_MAX_SPEED_HZ; }
-    if (v < -(s32)CFG_MOTION_MAX_SPEED_HZ) { return -(s32)CFG_MOTION_MAX_SPEED_HZ; }
+    if (v >  (s32)CFG_PUL_MAX_HZ) { return  (s32)CFG_PUL_MAX_HZ; }
+    if (v < -(s32)CFG_PUL_MAX_HZ) { return -(s32)CFG_PUL_MAX_HZ; }
     return v;
 }
 
@@ -141,6 +167,13 @@ void Motion_Init(void)
     s_speed_right = 0;
     s_abort       = 0;
     s_alive_ms    = 0;
+
+    /* 非阻塞通道一并清零：上电时"目标 = 当前速度 = 0"，
+     * 遥控状态机在拿到有效帧之前调 Motion_SlewTick() 也不会让车动。 */
+    s_target_left   = 0;
+    s_target_right  = 0;
+    s_slew_fraction = 0;
+    s_slew_ms       = Osal_GetTickMs();
 }
 
 /* ---------------------------------------------------------------------------
@@ -164,10 +197,13 @@ void Motion_Move(s32 vLeft, s32 vRight)
     Bsp_MotorPulse_SetDir(MOTION_CH_FR, (vRight < 0) ? MOTION_DIR_RIGHT_BWD : MOTION_DIR_RIGHT_FWD);
     Bsp_MotorPulse_SetDir(MOTION_CH_RR, (vRight < 0) ? MOTION_DIR_RIGHT_BWD : MOTION_DIR_RIGHT_FWD);
 
-    /* ⚠️ 顺序硬约束：必须先 StartAll() 再 SetFreq()。
-     * 因为 SetFreq(0) 会 HAL_TIM_Base_Stop() 掉整路时基；
-     * 若先 SetFreq 再 StartAll，会把本该停转的一侧用旧分频重新启动。 */
-    Bsp_MotorPulse_StartAll();
+    /* 顺序：先 SetDir，再 SetFreq。
+     *
+     * ⚠️ 这里**不调用** Bsp_MotorPulse_StartAll()：SetFreq(非零) 自己会按
+     *    "装载分频 → 打开 CCxE → 置 CEN" 的顺序把该侧启动起来，而 SetFreq(0)
+     *    会把该侧三道闸全关。所以：
+     *      · 一侧 0、一侧非零 → 停的那侧保持停，不会被顺带重启
+     *      · StartAll() 不看 PSC，无条件让两侧按旧分频开跑，正是它该被避开的原因 */
     Bsp_MotorPulse_SetFreq(MOTION_CH_FL, fl);          /* 左侧（FL/RL 共用 TIM1） */
     Bsp_MotorPulse_SetFreq(MOTION_CH_FR, fr);          /* 右侧（FR/RR 共用 TIM2） */
 
@@ -188,6 +224,16 @@ void Motion_Stop(void)
 
     s_speed_left  = 0;
     s_speed_right = 0;
+
+    /* ⚠️ 遥控通道也要一起清目标值，否则会出现"停不下来"：
+     *    RcControl_Tick() 只要摇杆还推着，每帧都会 Motion_SetTarget(非0)，
+     *    而 Motion_SlewTick() 下一拍就会把车重新推起来 —— 中间这段"停"
+     *    短到肉眼看不见。所以任何"停车"都必须同时把遥控目标清零。
+     *    （原来的 Motion_Stop 只清当前速度，因为过去没有别的写者。） */
+    s_target_left   = 0;
+    s_target_right  = 0;
+    s_slew_fraction = 0;
+    s_slew_ms       = Osal_GetTickMs();
 }
 
 void Motion_RequestAbort(void)
@@ -230,23 +276,28 @@ void Motion_Tick(void)
      *
      *    ⚠️ 这一条**必须**放在 s_alive_ms 判断之前。曾经的顺序是先
      *    `if (s_alive_ms == 0) return;` —— 而看门狗停车时恰好会把 s_alive_ms
-     *    清零，于是之后每圈都在第一行返回，安全网永远执行不到
-     *    （实测 s_forced_cnt 恒为 0 正是这个原因）。
+     *    清零，于是之后每圈都在第一行返回，安全网永远执行不到。
      *
-     *    CEN 已经是 0 时这里只有两次寄存器读，零开销。 */
+     *    这里**不需要**任何额外动作：本工程的 SetFreq(0) 是三道闸一起关
+     *    （CEN=0 + CCxE=0 + TIM1 MOE=0），停车之后引脚上一定没有脉冲；
+     *    而"速度都是 0"只可能来自 Motion_Stop()/Motion_StopImmediate()/
+     *    Motion_Move(0,0)，它们都已经走过一次 SetFreq(0)。
+     *    所以这条分支只做看门狗复位，零寄存器写。 */
     if ((s_speed_left == 0) && (s_speed_right == 0))
     {
-        Bsp_MotorPulse_EnsureStopped();
         s_alive_ms = 0;                    /* 已停稳，看门狗一并复位 */
         return;
     }
 
     if (s_alive_ms == 0)
     {
-        return;                            /* 还没收到过任何运动命令 */
+        /* ⚠️ 这里**不能**做任何事，包括 return —— 遥控（RcControl_Tick +
+         * Motion_SlewTick）走的不是"命令看门狗"这条路，它从来不设 s_alive_ms。
+         * 遥控的失效判定在 RcControl_Tick 里（CFG_RC_FRAME_TIMEOUT_MS=200ms，
+         * 比这里的 CFG_CMD_TIMEOUT_MS=3000ms 严得多），由那一层负责停车。
+         * 本函数只负责上位机命令的掉线保护。 */
     }
-
-    if ((Osal_GetTickMs() - s_alive_ms) > CFG_CMD_TIMEOUT_MS)
+    else if ((Osal_GetTickMs() - s_alive_ms) > CFG_CMD_TIMEOUT_MS)
     {
         Motion_Stop();
         s_alive_ms = 0;
@@ -441,3 +492,119 @@ void Motion_Demo(void)
 
     Motion_Brake();                       /* 6) 停车：两侧 S 曲线降到 0 */
 }
+
+/* ===========================================================================
+ * ⑤ 非阻塞遥控通道
+ *
+ *   与上面的阻塞动作**互不调用**：这一组从不 Delay、从不等待、不改方向，
+ *   只按节拍把速度朝目标推一小步。主循环必须一直能转，遥控才有意义。
+ * ============================================================================ */
+
+/* 遥控通道的限幅也用 CFG_PUL_MAX_HZ（与上面的 Motion_Clamp 保持同一个上限）。
+ *
+ * 如果要把遥控速度调低，改 cfg_rc.h 的 CFG_RC_MAX_SPEED_HZ 即可，
+ * 不要动这里 —— 这里只管"不许超过硬件能出的最高频"。 */
+static s32 Motion_ClampTarget(s32 speed)
+{
+    if (speed >  (s32)CFG_PUL_MAX_HZ) { return  (s32)CFG_PUL_MAX_HZ; }
+    if (speed < -(s32)CFG_PUL_MAX_HZ) { return -(s32)CFG_PUL_MAX_HZ; }
+    return speed;
+}
+
+void Motion_SetTarget(s32 vLeft, s32 vRight)
+{
+    s_target_left  = Motion_ClampTarget(vLeft);
+    s_target_right = Motion_ClampTarget(vRight);
+}
+
+/* 单侧朝目标走一步：
+ *   ① 目标与当前异号 → 先把目标压成 0（本步最多走到 0，绝不在带速时换向）
+ *   ② 剩下的按步长逼近，到不了就只走 step
+ * 返回新的速度值。 */
+static s32 Motion_SlewStep(s32 current, s32 target, s32 step)
+{
+    if (((current > 0) && (target < 0)) || ((current < 0) && (target > 0)))
+    {
+        target = 0;
+    }
+
+    if (current < target)
+    {
+        return ((target - current) <= step) ? target : (current + step);
+    }
+    if (current > target)
+    {
+        return ((current - target) <= step) ? target : (current - step);
+    }
+
+    return current;
+}
+
+void Motion_SlewTick(u32 nowMs)
+{
+    u32 elapsed = nowMs - s_slew_ms;
+    u32 credit;
+    u32 step;
+    s32 left;
+    s32 right;
+
+    if (elapsed < CFG_SCURVE_SAMPLE_MS)
+    {
+        return;                            /* 节拍未到：这一圈什么都不做 */
+    }
+
+    s_slew_ms = nowMs;
+
+    /* 主循环被别的阻塞动作拖住时，elapsed 可能很大。
+     * 夹紧到 CFG_MOTION_MAX_TICK_MS，否则一步就能跳过上百 Hz，等于没斜坡。 */
+    if (elapsed > CFG_MOTION_MAX_TICK_MS)
+    {
+        elapsed = CFG_MOTION_MAX_TICK_MS;
+    }
+
+    /* 本步允许的最大速度变化（Hz）：
+     *   accel(Hz/s) × elapsed(ms) / 1000 + 上一步的余数
+     * 用 64 位只是为了让 accel 取大值时不溢出；余数保留到下一步。 */
+    {
+        uint64_t tot = (uint64_t)s_accel_hz_per_s * (uint64_t)elapsed
+                     + (uint64_t)s_slew_fraction;
+        credit          = (u32)(tot / 1000ULL);
+        s_slew_fraction = (u32)(tot % 1000ULL);
+    }
+
+    if (credit == 0U)
+    {
+        return;                            /* 还没攒够 1Hz，等下一拍 */
+    }
+
+    /* 单侧最快也要 CFG_PUL_MAX_HZ 以上没有意义；夹一下防 step 过大 */
+    if (credit > (2U * (u32)CFG_PUL_MAX_HZ))
+    {
+        credit = 2U * (u32)CFG_PUL_MAX_HZ;
+    }
+    step = credit;
+
+    left  = Motion_SlewStep(s_speed_left,  s_target_left,  (s32)step);
+    right = Motion_SlewStep(s_speed_right, s_target_right, (s32)step);
+
+    if ((left != s_speed_left) || (right != s_speed_right))
+    {
+        Motion_Move(left, right);          /* 唯一改写硬件的地方，内部按需启停每一侧 */
+    }
+}
+
+void Motion_StopImmediate(void)
+{
+    /* 上面两次 SetFreq(0) 就已经把三道闸全关死了（CEN=0 + CCxE=0 + TIM1 MOE=0），
+     * 引脚上不可能再有脉冲，不需要再补一次"兜底关"。 */
+    Bsp_MotorPulse_SetFreq(MOTION_CH_FL, 0);
+    Bsp_MotorPulse_SetFreq(MOTION_CH_FR, 0);
+
+    s_speed_left    = 0;
+    s_speed_right   = 0;
+    s_target_left   = 0;
+    s_target_right  = 0;
+    s_slew_fraction = 0;
+    s_slew_ms       = Osal_GetTickMs();
+}
+

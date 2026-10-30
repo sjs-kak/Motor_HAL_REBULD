@@ -2,9 +2,15 @@
 #define BSP_RC_H
 
 #include "types.h"
+#include "cfg_rc.h"
 
 /* ============================================================================
- * Bsp 层 — 遥控接收机（PPM 单线）采集
+ * Bsp 层 — 遥控接收机（PWM / PPM 单线）采集
+ *
+ * ⚠️ 这是**备选**方案：默认走 i-BUS（USART3/PB11，见 Service/ibus.c）。
+ *    整个模块被 cfg_rc.h 的 CFG_RC_SOURCE_PWM 包住，默认配置下它是空的：
+ *    .c 编不出任何符号，也不会去占 TIM3/PA6。
+ *    只有把 CFG_RC_SOURCE_PWM 改成 1 才会生效，届时 app_rc.c 也必须编译。
  *
  * 本模块只负责一件事：**把线上的一串脉冲变成 6 个 µs 值**。
  * 通道含义、死区、映射到电机频率一律在 App 层（app_rc.c）决定 ——
@@ -15,6 +21,8 @@
  *
  * 阶段 A：采集 + 打印，不驱动电机。CFG_RC_DRIVE_ENABLE = 0。
  * ============================================================================ */
+
+#if (CFG_RC_SOURCE_PWM != 0)
 
 /* 配置 GPIO/TIM3/中断并开始捕获。App_Init() 里调一次。 */
 void Bsp_Rc_Init(void);
@@ -42,5 +50,6 @@ u32 Bsp_Rc_GetFrameCount(void);
 
 /* 初始化是否成功（0 = TIM3 配置失败，其余接口一律返回"无信号"） */
 u8 Bsp_Rc_IsReady(void);
+#endif /* CFG_RC_SOURCE_PWM */
 
 #endif /* BSP_RC_H */

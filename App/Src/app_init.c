@@ -6,6 +6,13 @@
 #include "cfg_motion.h"
 #include "app_rc.h"
 #include "cfg_debug.h"   /* 调试开关 CFG_DEBUG_AUTOTEST（默认 0，正常固件不生成代码） */
+#include "cfg_rc.h"      /* 遥控源选择：CFG_RC_SOURCE_IBUS / CFG_RC_SOURCE_PWM */
+#include "osal.h"        /* Osal_GetTickMs()：遥控状态机的时基 */
+
+#if (CFG_RC_SOURCE_IBUS != 0)
+#include "ibus.h"        /* Service 层：i-BUS 32 字节组帧/校验 */
+#include "rc_control.h"  /* App 层：摇杆 → 目标速度 → 斜坡推进 */
+#endif
 
 /* ============================================================================
  * App 层 — 集成点（原 Core/Src/main.c 的 USER CODE 段）
@@ -43,6 +50,29 @@
 
 /* 急停快通道的现场记录：中断里置位，主循环里打印 */
 static volatile u8 s_estop_hit = 0;
+
+#if (CFG_RC_SOURCE_IBUS != 0)
+/* ---------------------------------------------------------------------------
+ * 'R' 命令的遥控状态打印（i-BUS 方案）
+ *
+ * 只读，不推进状态机、不动电机 —— 这条命令要能在车跑着的时候随时敲，
+ * 所以它绝不能有副作用。帧龄 age= 是最有用的那个数：
+ *   推杆无反应但 age 一直在涨  → 根本没收到帧（接线/波特率/接错口）
+ *   推杆有反应但 L/R 不动      → 收到了但卡在 arm 判定（CH5 开关要拨下来）
+ * ------------------------------------------------------------------------ */
+static void App_RcIbusReport(void)
+{
+    RcControlStatus st;
+
+    RcControl_GetStatus(&st);
+    LOG("RC %s L=%d R=%d age=%ums RCERR=%u ARMED=%u\r\n",
+        RcControl_StateName(st.state),
+        (int)st.target_left, (int)st.target_right,
+        (unsigned int)st.frame_age_ms,
+        (unsigned int)Bsp_Uart_RcGetErrorCount(),
+        (unsigned int)Bsp_Uart_RcIsArmed());
+}
+#endif /* CFG_RC_SOURCE_IBUS */
 
 /* ---------------------------------------------------------------------------
  * 调试自动动作（CFG_DEBUG_AUTOTEST，见 Config/Inc/cfg_debug.h）
@@ -102,6 +132,14 @@ static void App_RxByte(u8 byte)
     {
         Motion_RequestAbort();
         Protocol_Reset();          /* 丢掉半截帧，免得 ESC 污染下一条命令 */
+#if (CFG_RC_SOURCE_IBUS != 0)
+        /* 上位机急停必须能压住遥控：摇杆还在推着的时候，光置 abort 标志
+         * 只停一瞬间，下一圈 RcControl_Tick() 又会把目标速度设回去。
+         * 所以这里同时调用 Motion_StopImmediate()，它会把遥控通道的
+         * 目标速度一并清零；摇杆回中之前遥控状态机会停在 disarm，
+         * 想继续用遥控必须先把杆回中（这是有意的，避免"一按急停就复跑"）。 */
+        Motion_StopImmediate();
+#endif
         s_estop_hit = 1;
         return;
     }
@@ -200,6 +238,21 @@ static void App_ExecCmd(const char *cmd)
                 (unsigned int)Bsp_Uart_GetTxDropCount(),
                 (unsigned int)Bsp_Uart_GetRxTotal(),
                 (unsigned int)Bsp_Uart_GetRxErrorCount());
+#if (CFG_RC_SOURCE_IBUS != 0)
+            /* 只读诊断：RC_ERR 涨说明接收机这一路被干扰（线太长/没屏蔽），
+             * RC_ARMED=0 说明中断接收根本没挂上 —— 两种"掉遥控"要分开查。 */
+            {
+                RcControlStatus st;
+
+                RcControl_GetStatus(&st);
+                LOG("RC %s L=%d R=%d age=%ums RCERR=%u ARMED=%u\r\n",
+                    RcControl_StateName(st.state),
+                    (int)st.target_left, (int)st.target_right,
+                    (unsigned int)st.frame_age_ms,
+                    (unsigned int)Bsp_Uart_RcGetErrorCount(),
+                    (unsigned int)Bsp_Uart_RcIsArmed());
+            }
+#endif
             break;
 
         case 'H':
@@ -208,13 +261,17 @@ static void App_ExecCmd(const char *cmd)
             LOG("      F<n> drive, L<a>,<b> diff, A<n> accel, D=demo\r\n");
             break;
 
-        /* ---- 遥控通道只读打印（阶段 A：只采集，不驱动电机） ----
-         * 这一条是遥控接线的验收命令：摇杆动，6 个数字跟着动。
-         * 输出格式：RC <ch1> <ch2> ... <ch6> age=<ms>
-         * 没信号时：RC nosig age=<ms> edges=<捕获沿数> frames=<完整帧数> */
+        /* ---- 遥控状态 ----
+         * i-BUS 方案：打印状态机 + 目标速度 + 帧龄 + 遥控串口错误/武装状态
+         *             （这是遥控接线的验收命令：推杆 → L/R 数字跟着变）
+         * PWM 方案（备选）：打印 6 个通道的 µs 值（阶段 A 只读，不驱动） */
         case 'R':
         case 'r':
+#if (CFG_RC_SOURCE_IBUS != 0)
+            App_RcIbusReport();
+#else
             App_Rc_Report();
+#endif
             break;
 
         /* ---- 直行 ---- */
@@ -313,13 +370,30 @@ void App_Init(void)
     /* 2) 四路电机初始化（打开 PWM 通道，保持时基停止） */
     Motion_Init();
 
-    /* 2b) 遥控接收机采集（阶段 A：只采集，不动电机）。
+#if (CFG_RC_SOURCE_IBUS != 0)
+    /* 2b) 遥控（i-BUS，USART3 / PB11）：
+     *     Ibus_Init() 只清状态；RcControl_Init() 记下上电时刻，
+     *     好让"接收机还没送出第一帧"这段时间按 failsafe 处理。
+     *     然后才把 Service 的字节喂养进来 —— 顺序反了会丢第一帧。 */
+    Ibus_Init();
+    RcControl_Init(Osal_GetTickMs());
+    Bsp_Uart_RcSetRxByteHandler(Ibus_FeedByte);
+    Bsp_Uart_RcRxStart();
+#else
+    /* 2b) 遥控（PWM/PPM 输入捕获，TIM3_CH1 / PA6）——备选方案，阶段 A 只采集。
      *     内部手工配置 TIM3_CH1，不依赖 CubeMX 生成的 tim.c。 */
     App_Rc_Init();
+#endif
 
     /* 3) 上电不再自启动任何动作 —— 等上位机命令。
      *    需要演示请发 'D'。 */
     LOG("READY. '?' for status, 'H' for help\r\n");
+#if (CFG_RC_SOURCE_IBUS != 0)
+    /* 把接线写进启动日志：现场最常见的"遥控没反应"就是线插错口。 */
+    LOG("RC: i-BUS USART3 115200 8N1, RX=PB11. Motors stopped.\r\n");
+#else
+    LOG("RC: PWM/PPM capture TIM3_CH1 PA6 (collect only).\r\n");
+#endif
 
     /* 4) 调试自动动作（默认关闭；见 Config/Inc/cfg_debug.h） */
 #if (CFG_DEBUG_AUTOTEST != 0)
@@ -354,13 +428,20 @@ void App_Loop(void)
     /* ---- ③ 掉线保护：超时没有运动命令就自动停车 ---------------------- */
     Motion_Tick();
 
-    /* ---- ③b 遥控采集（阶段 A：只读，不驱动电机）----------------------
-     * 现在只做两件事：解帧 + 检测"信号来了/丢了"并打日志。
-     * 阶段 B 才在这里做通道映射 → Motion_Move()。
-     * ⚠️ 只加这一行，不要重排周围的代码：另一个人正在改本文件时，
-     *    这样合并起来是一处干净的新增，不产生冲突。
-     * -------------------------------------------------------------------- */
+    /* ---- ③b 遥控 -----------------------------------------------------
+     * i-BUS 方案（默认）：RcControl_Tick() 内部完成
+     *   "新鲜度判定 → disarm/failsafe → 摇杆映射 → Motion_SetTarget()
+     *    → Motion_SlewTick() 非阻塞推进一步"。
+     * 它每一圈都必须被调用：遥控链路断开时正是靠这里每圈重判超时
+     * 才把车停下来的，漏调一次就等于遥控失效时车还在跑。
+     *
+     * PWM/PPM 方案（备选）：阶段 A 只采集不驱动，只做解帧与丢信号日志。
+     * ------------------------------------------------------------------ */
+#if (CFG_RC_SOURCE_IBUS != 0)
+    RcControl_Tick(Osal_GetTickMs());
+#else
     App_Rc_Tick();          /* USER-ANCHOR: 遥控接入点（阶段 A） */
+#endif
 
     /* ---- ④ 急停快通道的回执（中断里只置位，这里补一句日志）---------- */
     if (s_estop_hit != 0)

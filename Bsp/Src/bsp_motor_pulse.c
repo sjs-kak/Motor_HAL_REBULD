@@ -8,11 +8,6 @@
  *   固定 ARR（CFG_PUL_ARR），靠改 PSC 调频。
  * ============================================================================ */
 
-/* 诊断计数：见 bsp_motor_pulse.h 的说明 */
-static volatile u32 s_start_cnt  = 0;
-static volatile u32 s_stop_cnt   = 0;
-static volatile u32 s_forced_cnt = 0;
-
 /* 分清"哪一路通道属于哪一侧定时器" */
 static TIM_HandleTypeDef *Bsp_ChTimer(MotorChannel ch)
 {
@@ -57,8 +52,11 @@ static void Bsp_SetTimerFreq(TIM_HandleTypeDef *htim, u32 tim_clk, u32 freq)
 
     if (freq == 0)                          /* 频率为 0 即为停止 */
     {
-        s_stop_cnt++;
-        HAL_TIM_Base_Stop(htim);
+        /* HAL_TIM_Base_Stop uses __HAL_TIM_DISABLE, which preserves CEN while
+         * CCxE is set. We own this whole timer, so stop it unconditionally and
+         * gate BOTH channels on the side. No residual pulse train is allowed. */
+        CLEAR_BIT(htim->Instance->CR1, TIM_CR1_CEN);
+        CLEAR_BIT(htim->Instance->CCER, TIM_CCER_CC1E | TIM_CCER_CC2E);
         return;
     }
 
@@ -67,32 +65,26 @@ static void Bsp_SetTimerFreq(TIM_HandleTypeDef *htim, u32 tim_clk, u32 freq)
 
     psc = (tim_clk / (freq * CFG_PUL_ARR)) - 1;
     __HAL_TIM_SET_PRESCALER(htim, psc);
-
-    /* ⚠️ 只有定时器**停止着**的时候才能写 UG（更新事件）。
-     *
-     * UG 会把计数器清零并重新装载预分频器——如果定时器正在输出脉冲，
-     * 这等于把当前这个脉冲强行截断/拉长，可能短到 <2.5µs。
-     * M860D 手册要求脉冲高低电平各 ≥2.5µs，短脉冲驱动器不认 = 丢步，
-     * 四轮丢步不齐就是"原地打滑 / 空转 / 电流上升"。
-     *
-     * 而运行中改 PSC 本来就会在**下一个更新事件自动生效**（PSC 有影子寄存器），
-     * 根本不需要 UG 帮忙，最多晚一个脉冲周期。
-     * S 曲线每 8ms 改一次频率，晚一个周期（400µs）完全无感。 */
     if ((htim->Instance->CR1 & TIM_CR1_CEN) == 0U)
     {
+        /* A stopped side loads its divider before exposing either output. */
         htim->Instance->EGR = TIM_EGR_UG;
+        SET_BIT(htim->Instance->CCER, TIM_CCER_CC1E | TIM_CCER_CC2E);
+        __HAL_TIM_ENABLE(htim);
     }
+    /* Running timer: PSC is buffered and loads at the next natural overflow
+     * (RM0090). Do NOT generate UG here: it resets the counter phase. Small
+     * RC changes every 8 ms could otherwise suppress low-frequency steps or
+     * truncate pulses indefinitely. A stop still gates both channels above. */
 }
 
 void Bsp_MotorPulse_Init(void)
 {
-    HAL_TIM_PWM_Start(BOARD_HTIM_LEFT,  TIM_CHANNEL_1);
-    HAL_TIM_PWM_Start(BOARD_HTIM_LEFT,  TIM_CHANNEL_2);
-    HAL_TIM_PWM_Start(BOARD_HTIM_RIGHT, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Start(BOARD_HTIM_RIGHT, TIM_CHANNEL_2);
-
-    HAL_TIM_Base_Stop(BOARD_HTIM_LEFT);
-    HAL_TIM_Base_Stop(BOARD_HTIM_RIGHT);
+    /* CubeMX already configured PWM mode/CCR. Do NOT call PWM_Start here:
+     * it would briefly start pulses at reset before RC has been armed. */
+    Bsp_SetTimerFreq(BOARD_HTIM_LEFT, CFG_TIM1_CLK_HZ, 0);
+    Bsp_SetTimerFreq(BOARD_HTIM_RIGHT, CFG_TIM2_CLK_HZ, 0);
+    __HAL_TIM_MOE_ENABLE(BOARD_HTIM_LEFT);
 }
 
 void Bsp_MotorPulse_SetDir(MotorChannel ch, MotorDir dir)
@@ -108,46 +100,8 @@ void Bsp_MotorPulse_SetFreq(MotorChannel ch, u32 hz)
 
 void Bsp_MotorPulse_StartAll(void)
 {
-    s_start_cnt++;
-
-    /* TIM1 是高级定时器：除了 CEN，还要 BDTR.MOE=1 输出才会真正到引脚。
-     * HAL_TIM_PWM_Start 当初已经置过 MOE，但 EnsureStopped 会把它关掉，
-     * 所以每次启动都要重新打开。 */
-    __HAL_TIM_MOE_ENABLE(BOARD_HTIM_LEFT);
-
-    (void)HAL_TIM_Base_Start(BOARD_HTIM_LEFT);
-    (void)HAL_TIM_Base_Start(BOARD_HTIM_RIGHT);
-}
-
-/* ---------------------------------------------------------------------------
- * 幂等兜底：两层，任何一层生效就没有脉冲
- *   第一层：清 CEN（对 TIM1 / TIM2 都有效）
- *   第二层：TIM1 关 MOE —— 高级定时器的主输出使能，为 0 时**无论 CEN、CCR、
- *           CCER 是什么状态，输出引脚都被硬件强制为无效电平**
- *
- * 实测背景：速度已清零、CEN 被这里反复清掉，但定时器又在同一圈里被重新使能
- * （s_forced_cnt 涨到 500 万仍没停）。第二层就是针对这种"CEN 被别人抢回去"
- * 的场合：不依赖 CEN 也能停。
- * ------------------------------------------------------------------------ */
-void Bsp_MotorPulse_EnsureStopped(void)
-{
-    if ((BOARD_HTIM_LEFT->Instance->CR1 & TIM_CR1_CEN) != 0U)
-    {
-        s_forced_cnt++;
-        BOARD_HTIM_LEFT->Instance->CR1 &= ~TIM_CR1_CEN;
-    }
-
-    if ((BOARD_HTIM_RIGHT->Instance->CR1 & TIM_CR1_CEN) != 0U)
-    {
-        s_forced_cnt++;
-        BOARD_HTIM_RIGHT->Instance->CR1 &= ~TIM_CR1_CEN;
-    }
-
-    /* 第二层兜底：直接关主输出 */
-    __HAL_TIM_MOE_DISABLE(BOARD_HTIM_LEFT);
-}
-
-__attribute__((used)) u32 Bsp_MotorPulse_GetForcedStopCount(void)
-{
-    return s_forced_cnt;
+    SET_BIT(BOARD_HTIM_LEFT->Instance->CCER, TIM_CCER_CC1E | TIM_CCER_CC2E);
+    SET_BIT(BOARD_HTIM_RIGHT->Instance->CCER, TIM_CCER_CC1E | TIM_CCER_CC2E);
+    __HAL_TIM_ENABLE(BOARD_HTIM_LEFT);
+    __HAL_TIM_ENABLE(BOARD_HTIM_RIGHT);
 }

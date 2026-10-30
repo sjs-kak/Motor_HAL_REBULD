@@ -97,6 +97,7 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_USART1_UART_Init();
+  MX_USART3_UART_Init();      /* 遥控接收机 i-BUS：只收，RX=PB11（AF7） */
   /* USER CODE BEGIN 2 */
   App_Init();                 /* 串口接收 + 四电机初始化（全部在 App 层） */
 

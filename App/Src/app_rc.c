@@ -1,6 +1,11 @@
 #include "app_rc.h"
-#include "bsp_rc.h"
 #include "cfg_rc.h"
+
+/* 本文件属于 PWM/PPM 备选方案，默认（i-BUS）下整个文件编空。
+ * 见 cfg_rc.h 的 CFG_RC_SOURCE_PWM 说明。 */
+#if (CFG_RC_SOURCE_PWM != 0)
+
+#include "bsp_rc.h"
 #include "log.h"
 
 /* ============================================================================
@@ -100,3 +105,5 @@ void App_Rc_Report(void)
     }
     LOG(" age=%u\r\n", (unsigned int)age);
 }
+
+#endif /* CFG_RC_SOURCE_PWM */

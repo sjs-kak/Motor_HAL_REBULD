@@ -1,6 +1,13 @@
 #include "bsp_rc.h"
 #include "mx_board.h"
 #include "cfg_rc.h"
+
+/* 本文件只属于 PWM / PPM 备选方案：默认配置是 i-BUS（CFG_RC_SOURCE_IBUS），
+ * 此时整个文件编空 —— 不出符号、不占 TIM3、不动 PA6。
+ * 切到 CFG_RC_SOURCE_PWM = 1 才真正编译下面的代码。
+ * 这样两套遥控代码可以同时留在树里，而不会有两份"TIM3 中断"打架。 */
+#if (CFG_RC_SOURCE_PWM != 0)
+
 #include "osal.h"
 
 /* ============================================================================
@@ -304,3 +311,5 @@ u8 Bsp_Rc_GetChannels(u16 *us, u8 n)
 
     return ok;
 }
+
+#endif /* CFG_RC_SOURCE_PWM */

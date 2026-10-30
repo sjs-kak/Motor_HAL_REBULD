@@ -4,19 +4,40 @@
 #include "types.h"
 
 /* ============================================================================
- * 串口（与上位机通信）— 只负责"把收到的字节交给上层"，
- * 不解析协议、不组帧（那是 Service 层 protocol.c 的事）。
+ * 串口（USART1 上位机 + USART3 遥控 i-BUS）— 只负责"把收到的字节交给上层"，
+ * 不解析协议、不组帧（那是 Service 层 protocol.c / ibus.c 的事）。
  *
- * ⚠️ 绝不能再自己定义 USART1_IRQHandler！
- *    Core/Src/stm32f4xx_it.c 里已经有一个（它调用 HAL_UART_IRQHandler(&huart1)），
+ * ⚠️ 绝不能再自己定义 USART1_IRQHandler / USART3_IRQHandler！
+ *    Core/Src/stm32f4xx_it.c 里已经各有一个（分别调 HAL_UART_IRQHandler(&huartN)），
  *    重复定义会导致串口整个收不到数据（链接不报错，行为直接错）。
  * ============================================================================ */
 
 /* 收到 1 字节时回调；由上层注册（App/Src/app_init.c 注册 Protocol_FeedByte） */
 typedef void (*Bsp_Uart_RxByteHandler)(u8 byte);
 
-void Bsp_Uart_RxStart(void);                                   /* 启动中断接收 */
+void Bsp_Uart_RxStart(void);                                   /* 启动主机接收 */
 void Bsp_Uart_SetRxByteHandler(Bsp_Uart_RxByteHandler handler); /* 注册回调 */
+
+/* ---------------------------------------------------------------------------
+ * 遥控串口（USART3 / i-BUS）
+ *
+ * 语义与主机串口完全一致：只交字节、不解析 —— i-BUS 的组帧在
+ * Service/Src/ibus.c 里（App 注册 Ibus_FeedByte）。
+ *
+ * 为什么不做成 Bsp_Uart_OpenChannel(&huart3, ...) 就完事：
+ *   遥控链路是"丢了就失控"的那一路。它需要能在调试器里一眼看出
+ *   "接收武装上没有、线路错误多少次"，所以给它一组显式入口和
+ *   独立的错误计数，不与主机通道的计数混在一起。
+ * ------------------------------------------------------------------------ */
+void Bsp_Uart_RcRxStart(void);
+void Bsp_Uart_RcSetRxByteHandler(Bsp_Uart_RxByteHandler handler);
+u32  Bsp_Uart_RcGetErrorCount(void);
+
+/* 遥控串口是否已武装（1 = 正常）。掉遥控时先看这个：
+ *   0          → 中断接收没挂上，问题在本层（大概率 ORE 后没恢复过来）
+ *   1 但仍无帧 → 字节到了，问题在 ibus.c 的组帧/校验或接线
+ * ------------------------------------------------------------------------ */
+u8   Bsp_Uart_RcIsArmed(void);
 
 /* ---------------------------------------------------------------------------
  * 多路串口：按 Instance 注册接收通道（X2）
@@ -68,5 +89,28 @@ u32 Bsp_Uart_GetTxDropCount(void);
  * ------------------------------------------------------------------------ */
 u32 Bsp_Uart_GetRxTotal(void);
 u32 Bsp_Uart_GetRxErrorCount(void);
+
+/* ---------------------------------------------------------------------------
+ * 遥控接收机（USART3，i-BUS）：第二条独立的接收通道
+ *
+ * 与主机通道**完全隔离**：各自的武装状态、各自的错误计数、各自的回调。
+ * 隔离是必须的——主机链路抖一下不该影响遥控，遥控断了更不能悄悄
+ * 记到主机计数里（那会让现场排查看错方向）。
+ *
+ * 接线：FS-iA6B 的 i-BUS 信号 → PB11（USART3_RX），115200 8N1。
+ * ------------------------------------------------------------------------ */
+void Bsp_Uart_RcSetRxByteHandler(Bsp_Uart_RxByteHandler handler);
+void Bsp_Uart_RcRxStart(void);          /* 清 ORE 后武装接收，App_Init 里调一次 */
+
+/* 遥控线路错误次数（ORE/FE/NE）。非 0 且持续增长 → 先查线与共地，再怀疑接收机 */
+u32 Bsp_Uart_RcGetErrorCount(void);
+
+/* 遥控通道是否已武装（1=中断已在等字节）。
+ *
+ * 判读口诀（现场最有用的一条）：
+ *   ARMED == 0           → 中断根本没挂上，问题在**本层**（bsp_uart.c 的 Rearm）
+ *   ARMED == 1 但没数据  → 中断在等，是**组帧**或**接线**的问题（ibus.c / PB11）
+ * ------------------------------------------------------------------------ */
+u8 Bsp_Uart_RcIsArmed(void);
 
 #endif /* BSP_UART_H */

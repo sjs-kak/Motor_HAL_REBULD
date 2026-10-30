@@ -57,6 +57,7 @@
 
 /* External variables --------------------------------------------------------*/
 extern UART_HandleTypeDef huart1;
+extern UART_HandleTypeDef huart3;   /* 遥控 i-BUS（USART3，只收 PB11） */
 extern TIM_HandleTypeDef htim6;
 
 /* USER CODE BEGIN EV */
@@ -232,6 +233,17 @@ void USART1_IRQHandler(void)
   /* USER CODE BEGIN USART1_IRQn 1 */
 
   /* USER CODE END USART1_IRQn 1 */
+}
+
+/**
+  * @brief This function handles USART3 (遥控接收机 i-BUS) global interrupt.
+  *
+  * ⚠️ 与 USART1 一样由 CubeMX 生成，不要另外在 Bsp 层再定义一次 ——
+  *    重复定义不会链接报错，但其中一个会被丢弃，表现为遥控"完全没数据"。
+  */
+void USART3_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart3);
 }
 
 /**

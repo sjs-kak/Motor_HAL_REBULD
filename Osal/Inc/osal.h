@@ -20,4 +20,8 @@
 void Osal_DelayMs(u32 ms);        /* 阻塞延时 ms 毫秒（现在 = HAL_Delay） */
 u32  Osal_GetTickMs(void);        /* 系统启动以来的毫秒滴答（现在 = HAL_GetTick） */
 
+/* Short ISR/main snapshot protection; restore the original interrupt mask. */
+u32  Osal_EnterCritical(void);
+void Osal_ExitCritical(u32 key);
+
 #endif /* OSAL_OSAL_H */

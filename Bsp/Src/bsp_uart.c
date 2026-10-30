@@ -47,6 +47,12 @@ static volatile u32 s_tx_drop = 0;
 static volatile u32 s_rx_total = 0;
 static volatile u32 s_rx_err   = 0;
 
+/* 遥控串口（USART3）的线路错误**单独**计数。
+ * 为什么要分开：主机通道的 s_rx_err 涨了只影响日志和命令回显；
+ * 遥控通道的错涨了意味着车可能正在失控。混成一个数，现场就分不清
+ * "是上位机线松了"还是"接收机被打断了"——这两种故障处理方式完全不同。 */
+static volatile u32 s_rc_err = 0;
+
 /* ---------------------------------------------------------------------------
  * 通道表：查找 / 新建
  * ------------------------------------------------------------------------ */
@@ -172,6 +178,51 @@ u8 Bsp_Uart_IsArmed(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * 遥控串口（USART3 / i-BUS）
+ *
+ * 实现上就是通道表里的第二路 —— 复用同一套 Rearm/Service 自愈逻辑，
+ * 不另写一份"特殊的"接收代码。差别只有两点：
+ *   ① 错误计数单独记（s_rc_err），因为它的后果比主机通道严重得多；
+ *   ② 多一个 RcIsArmed() 供现场把"没武装"和"没帧"这两种掉遥控区分开。
+ * ------------------------------------------------------------------------ */
+void Bsp_Uart_RcSetRxByteHandler(Bsp_Uart_RxByteHandler handler)
+{
+    Bsp_Uart_Channel *c = Bsp_Uart_New(BOARD_HUART_RC);
+
+    if (c != 0)
+    {
+        c->handler = handler;
+    }
+}
+
+void Bsp_Uart_RcRxStart(void)
+{
+    Bsp_Uart_Channel *c = Bsp_Uart_New(BOARD_HUART_RC);
+
+    if (c == 0)
+    {
+        return;                            /* 表满：Caller 侧没处报错，靠 RcIsArmed() 看 */
+    }
+
+    /* 丢掉启动前积在线路上的半截字节并清 ORE：
+     * 不清的话第一帧 i-BUS 大概率从中间开始，要等最多 32 字节才对齐。 */
+    __HAL_UART_CLEAR_OREFLAG(BOARD_HUART_RC);
+    Bsp_Uart_Rearm(c);
+}
+
+u32 Bsp_Uart_RcGetErrorCount(void)
+{
+    return s_rc_err;
+}
+
+u8 Bsp_Uart_RcIsArmed(void)
+{
+    Bsp_Uart_Channel *c = Bsp_Uart_Find(BOARD_HUART_RC);
+
+    return (u8)((c != 0) ? c->armed : 0);
+}
+
+/* ---------------------------------------------------------------------------
  * 发送：阻塞等 TC，但最多等 CFG_UART_TX_TIMEOUT_MS
  *   超时 = 放弃这几个字节并计数。日志丢几个字没人看，
  *   主循环卡死（掉线保护失效、车一直转）是不能接受的。
@@ -257,7 +308,15 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     Bsp_Uart_Channel *c = Bsp_Uart_Find(huart);
 
-    s_rx_err++;                            /* 诊断：线路错误次数 */
+    /* 遥控通道的错误单独计数（主机通道仍用 s_rx_err） */
+    if (huart->Instance == BOARD_UART_RC_INSTANCE)
+    {
+        s_rc_err++;
+    }
+    else
+    {
+        s_rx_err++;                        /* 诊断：线路错误次数 */
+    }
 
     __HAL_UART_CLEAR_OREFLAG(huart);
     __HAL_UART_CLEAR_NEFLAG(huart);
